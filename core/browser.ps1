@@ -100,6 +100,52 @@ function Test-CdpBrowser {
     return [bool]($i -and $i.Browser)
 }
 
+# 端口上这个浏览器有没有窗口。
+# headless 的没有 —— 对这个程序等于没有浏览器：用户得看得见窗口才能登录 Epic、
+# 才能过 Cloudflare 的人机验证。判据是 /json/version 的 User-Agent：
+# 实测有头 Chrome 是 "Chrome/153.0.0.0"，无头是 "HeadlessChrome/153.0.0.0"。
+function Test-CdpHeaded {
+    param([int]$Port = $(if ($script:BPort) { $script:BPort } else { 9222 }))
+    $i = Get-CdpInfo -Port $Port
+    if (-not $i -or -not $i.Browser) { return $false }
+    return -not ([string]$i.'User-Agent' -match 'HeadlessChrome')
+}
+
+# 上次本程序启动的浏览器进程号（记在 settings.json 的 cdpPid）。
+#   有记录、进程还在  → 是我们的
+#   有记录、进程没了  → 端口上那个是别人的（我们那个早关了）
+#   没记录（全新安装/删过 settings.json）→ 判断不了，按"是"处理，宁可漏判也别误伤
+function Test-CdpIsOurs {
+    $s = Read-BSettings
+    $owner = 0
+    try { $owner = [int]$s['cdpPid'] } catch { return $true }
+    if ($owner -le 0) { return $true }
+    try { $null = Get-Process -Id $owner -ErrorAction Stop; return $true } catch { return $false }
+}
+
+<#
+  端口上那个浏览器能不能直接拿来用。返回 @{ ok; kind; why }
+  kind: 'ok' | 'none'（端口上没浏览器）| 'unusable'（有，但不能用）
+
+  ★ 为什么不能只判 Test-CdpBrowser
+  实测踩过：另一个工具在本机开了个 headless Chrome 占着 9222（--headless=new
+  --user-data-dir=%TEMP%\cdp-*），本程序"端口上有个 Chromium"就直接接了上去了。
+  症状是「没有窗口 + 未登录 + 被 Cloudflare 拦」，三条全都没指向真正的原因，
+  排查了很久。headless 天生干不了这件事（没窗口，用户没法登录也没法过验证），
+  别人的浏览器也不该抢 —— 另一头可能是别人的自动化任务，抢过来两边都坏。
+#>
+function Test-CdpReusable {
+    param([int]$Port = $(if ($script:BPort) { $script:BPort } else { 9222 }))
+    if (-not (Test-CdpBrowser -Port $Port)) { return @{ ok = $false; kind = 'none'; why = $null } }
+    if (-not (Test-CdpHeaded -Port $Port)) {
+        return @{ ok = $false; kind = 'unusable'; why = '是个没有窗口的 headless 浏览器' }
+    }
+    if (-not (Test-CdpIsOurs)) {
+        return @{ ok = $false; kind = 'unusable'; why = '不是本程序启动的（上次那个已经关了）' }
+    }
+    return @{ ok = $true; kind = 'ok'; why = $null }
+}
+
 function Test-PortOpen {
     param([int]$Port)
     $c = New-Object System.Net.Sockets.TcpClient
@@ -388,8 +434,9 @@ function Ensure-BrowserWork {
     if (-not $script:BPort) { Initialize-BPort }
     $result = @{ ok = $false; exe = ''; source = ''; browser = ''; port = $script:BPort; error = $null; tried = @() }
 
-    # 端口上已经有一个真浏览器在跑 —— 直接复用（这是最常见的情况）
-    if (Test-CdpBrowser -Port $script:BPort) {
+    # 端口上已经有一个能直接用的浏览器 —— 复用（这是最常见的情况）
+    $re = Test-CdpReusable -Port $script:BPort
+    if ($re.ok) {
         $info = Get-CdpInfo -Port $script:BPort
         & $say "已连接到正在运行的浏览器（$($info.Browser)）"
         $result.ok = $true; $result.browser = [string]$info.Browser; $result.source = '已在运行'
@@ -397,9 +444,18 @@ function Ensure-BrowserWork {
         return $result
     }
 
+    # 端口上有个浏览器、但不能直接拿来用（headless / 别人的）：换端口，别去动它。
+    # 从 端口+1 开始找 —— 从原端口开始的话 Resolve-FreePort 一眼就看见"这儿有浏览器"，
+    # 会把同一个端口原样还回来。
+    if ($re.kind -eq 'unusable') {
+        & $say "端口 $($script:BPort) 上的浏览器不能直接用（$($re.why)），换个端口"
+        $script:BPort = (Resolve-FreePort -Start ($script:BPort + 1)).Port
+        $result.port = $script:BPort
+        & $say "改用端口 $($script:BPort)"
+    }
     # 端口被非浏览器占着：Chromium 遇到端口被占不会报错，只会静默地不开调试端口，
     # 一路看下来就是"浏览器起不来"。换个端口比在这上面耗着强。
-    if (Test-PortOpen -Port $script:BPort) {
+    elseif (Test-PortOpen -Port $script:BPort) {
         & $say "端口 $($script:BPort) 被其它程序占用了，换一个"
         $fp = Resolve-FreePort -Start $script:BPort
         if ($fp.Port -ne $script:BPort) {
@@ -427,7 +483,8 @@ function Ensure-BrowserWork {
             & $say "已连接：$($r.browser)"
             # 钉住这个，下次直接用，也保证计划任务用的是同一个。
             # 只写 lastBrowser，绝不写 browser —— 那是用户手动指定的位置。
-            Save-BSettings @{ lastBrowser = $c.Path; cdpPort = $script:BPort }
+            # cdpPid 是"这个端口上的浏览器是我们的"的凭据，下次启动要靠它认人。
+            Save-BSettings @{ lastBrowser = $c.Path; cdpPort = $script:BPort; cdpPid = $r.proc.Id }
             Clear-BError
             return $result
         }

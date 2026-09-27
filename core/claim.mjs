@@ -168,6 +168,8 @@ function friendlyReason(info) {
   if (s === 'no-cta') return '商品页上没找到「领取」按钮，可能页面改版了';
   if (s === 'no-place-order') return '结账页面没找到「Add to library」按钮，可能页面改版了';
   if (/未确认成功/.test(s)) return '结账没走完，可能是验证码没通过 —— 可以打开浏览器窗口手动领取一次';
+  // 必须排在 401/403 那条前面：挑战页里也带 "HTTP 403"，混在一起会把风控说成掉登录
+  if (CF_MARK.test(s)) return '被 Cloudflare 人机验证拦住了 —— 请到浏览器窗口完成验证后重试';
   if (/HTTP 401|HTTP 403/.test(s)) return '登录状态失效了，请重新登录 Epic 账号';
   if (/HTTP 429/.test(s)) return '请求太频繁被限流，等几分钟再试';
   if (/复核未通过/.test(s)) return '结账后没能确认入库，请打开 Fab 网站手动看一眼';
@@ -277,8 +279,18 @@ async function assertChromeUp() {
   try {
     const r = await fetch(`${CFG.cdp}/json/version`, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
+    const ver = await r.json();
+    // 没有窗口的 headless 浏览器干不了这件事：用户得有窗口才能登录、才能过人机验证。
+    // 端口被别的工具占着时很容易接上这种东西（实测踩过：另一个工具的 headless
+    // Chrome 占着 9222），早点说清楚，比让人对着"请点一下验证框"干等 5 分钟强。
+    if (/HeadlessChrome/i.test(ver['User-Agent'] || '')) {
+      const err = new Error('当前连的是一个没有窗口的 headless 浏览器，没法登录 / 过人机验证。');
+      err.code = 'HEADLESS_BROWSER';
+      throw err;
+    }
+    return ver;
   } catch (e) {
+    if (e.code === 'HEADLESS_BROWSER') throw e;   // 别被下面的兜底包装成"连不上"
     const err = new Error(`连不上浏览器调试端口 ${CFG.cdp}`);
     err.code = 'NO_BROWSER';
     err.cause = e;
@@ -306,12 +318,70 @@ async function evalRetry(page, fn, arg, tries = 4) {
   throw lastErr;
 }
 
+// ---------- Cloudflare 人机验证 ----------
+// Fab 前面挂着 Cloudflare 的防护。它觉得这个浏览器可疑时，所有 /i/ 接口都会返回一张
+// 「请稍候…」挑战页（HTML）而不是 JSON —— 日志里那段 <html> 就是这么来的。
+// 既不是程序坏了，也不是没登录：用户在浏览器窗口点一下「确认您是真人」就能过。
+// 所以这里不报错退出，而是把浏览器让给用户、每 5 秒探一次，过了自动接着跑 ——
+// 跟等登录是同一个套路。等太久（下方 timeoutMs）才放弃，免得界面永远卡在「处理中」。
+const CF_MARK = /cf_challenge|cf-chl|__cf_chl|challenges\.cloudflare\.com|Just a moment|Verifying you are human|Enable JavaScript and cookies|请稍候/i;
+
+/** 状态码非 200 且正文是挑战页 → 被 Cloudflare 拦了（注意别把真没登录的 401 算进来） */
+function isCfChallenge(status, body) {
+  if (status === 200) return false;
+  return CF_MARK.test(typeof body === 'string' ? body : '');
+}
+
+const CF_WAIT = { pollMs: 5000, timeoutMs: 5 * 60 * 1000 };
+const CF_TIMEOUT_HINT = 'Cloudflare 人机验证一直没通过。请切到浏览器窗口把「确认您是真人」做完，然后重新点「刷新批次」。';
+
+/** 被拦下时抛这个：调用方据此走「等用户过验证」而不是报错 */
+function cfError(what, status) {
+  const e = new Error(`${what}被 Cloudflare 人机验证拦住（HTTP ${status}）`);
+  e.cfBlocked = true;
+  return e;
+}
+
+/**
+ * 等用户过验证。返回 true = 已通过（可以继续），false = 等超时了。
+ * 探针就用 /i/users/me：它既看得出"还被拦着"，通了之后也顺手带回登录态。
+ */
+async function waitForCfPass(page) {
+  log('⚠️ 被 Cloudflare 人机验证拦住了（Fab 前面的防护，不是你操作错了）。');
+  log('   请切到浏览器窗口点一下验证框；程序每 5 秒自动检查，通过后会自己接着跑。');
+  emit({ ev: 'challenge', ok: false });
+  // 把标签页调到前面。GUI 收到 challenge 事件后会临时取消置顶，所以这里调起来看得见。
+  await page.bringToFront().catch(() => {});
+  const t0 = Date.now();
+  for (let i = 1; ; i++) {
+    await sleep(CF_WAIT.pollMs);
+    let r = null;
+    try { r = await pageApi.me(page); } catch { r = null; }
+    const sec = Math.round((Date.now() - t0) / 1000);
+    if (r && !r.blocked) {
+      emit({ ev: 'challenge', ok: true });
+      log(`✅ 人机验证已通过（等了 ${sec} 秒），继续。`);
+      return true;
+    }
+    if (sec >= CF_WAIT.timeoutMs / 1000) {
+      emit({ ev: 'challenge', ok: false, timeout: true });
+      log(`❌ 人机验证等了 ${sec} 秒还没过，先停下。`);
+      return false;
+    }
+    if (i % 6 === 0) {          // 每 30 秒给界面一个心跳，让人知道程序还活着
+      emit({ ev: 'challenge', ok: false, sec });
+      log(`   还在等人机验证…（已等 ${sec} 秒）`);
+    }
+  }
+}
+
 const pageApi = {
   async discover(page) {
     const r = await evalRetry(page, async (url) => {
       const res = await fetch(url, { headers: { accept: 'application/json' }, credentials: 'include' });
       return { status: res.status, body: res.ok ? await res.json() : await res.text() };
     }, CFG.bladeUrl);
+    if (isCfChallenge(r.status, r.body)) throw cfError('拉取批次', r.status);
     if (r.status !== 200) throw new Error(`blade 接口返回 ${r.status}: ${String(r.body).slice(0, 200)}`);
     return (r.body.tiles || []).map((t) => {
       const l = t.listing || {};
@@ -326,12 +396,15 @@ const pageApi = {
    * 登录态 + 用户名：/i/users/me 登录时 200 带 displayName，未登录 401。
    * 注意 checked 字段：只有真正问到服务端才算 checked=true。
    * 抛异常时调用方必须当成"没查出来"，绝不能当成"未登录"。
+   * blocked=true 是第三种情况：被 Cloudflare 拦了 —— 同样不是"未登录"，
+   * 混在一起会让界面喊用户去登录，而问题根本不在登录。
    */
   async me(page) {
     const r = await evalRetry(page, async () => {
       const res = await fetch('/i/users/me', { headers: { accept: 'application/json' }, credentials: 'include' });
-      return { status: res.status, body: res.ok ? await res.json() : null };
+      return { status: res.status, body: res.ok ? await res.json() : (await res.text()).slice(0, 4000) };
     });
+    if (isCfChallenge(r.status, r.body)) return { ok: false, name: null, status: r.status, checked: false, blocked: true };
     if (r.status !== 200) return { ok: false, name: null, status: r.status, checked: true };
     return { ok: true, name: r.body?.displayName || null, status: 200, checked: true };
   },
@@ -343,6 +416,7 @@ const pageApi = {
       const res = await fetch(url, { headers: { accept: 'application/json' }, credentials: 'include' });
       return { status: res.status, body: res.ok ? await res.json() : await res.text() };
     }, `/i/users/me/listings-states?${q}`);
+    if (isCfChallenge(r.status, r.body)) throw cfError('查归属', r.status);
     if (r.status !== 200) throw new Error(`listings-states 返回 ${r.status}（多为未登录）`);
     return Object.fromEntries((r.body || []).map((x) => [x.uid, x.acquired]));
   },
@@ -352,6 +426,7 @@ const pageApi = {
       const res = await fetch(url, { headers: { accept: 'application/json' }, credentials: 'include' });
       return { status: res.status, body: res.ok ? await res.json() : await res.text() };
     }, `/i/listings/${uid}`);
+    if (isCfChallenge(r.status, r.body)) throw cfError('查商品详情', r.status);
     if (r.status !== 200) throw new Error(`listings/${uid} 返回 ${r.status}`);
     return r.body;
   },
@@ -492,7 +567,9 @@ async function main() {
   try {
     ver = await assertChromeUp();
   } catch (e) {
-    fatal('NO_BROWSER', '浏览器没有启动。点「打开浏览器」重试。');
+    fatal('NO_BROWSER', e.code === 'HEADLESS_BROWSER'
+      ? `${e.message}请点「打开浏览器」重新启动一个。`
+      : '浏览器没有启动。点「打开浏览器」重试。');
     process.exitCode = 3;
     return;
   }
@@ -520,11 +597,23 @@ async function main() {
 
     // ---- 登录态 ----
     emit({ ev: 'phase', phase: 'login', text: '正在检查登录状态…' });
-    // checked=false 表示"没查出来"（页面在跳转等），绝不能当成"未登录"报给界面 ——
+    // checked=false 表示"没查出来"（页面在跳转、被 Cloudflare 拦），绝不能当成"未登录"报给界面 ——
     // 那会把界面上一秒刚确认的已登录状态错误地降级。
     let me = { ok: false, name: null, checked: false };
     try { me = await pageApi.me(page); } catch (e) { log(`  ⚠️ 登录态检查失败：${e.message}`); }
-    emit({ ev: 'login', ok: me.ok, name: me.name, checked: me.checked });
+
+    // 被 Cloudflare 拦下时登录态和批次接口会一起失效。先让用户去过验证，
+    // 过了再重新问一次 —— 别拿"未登录"去误导他（那会打开一个根本不需要的登录页）。
+    if (me.blocked) {
+      if (!(await waitForCfPass(page))) {
+        fatal('CF_BLOCKED', CF_TIMEOUT_HINT);
+        process.exitCode = 1;
+        return;
+      }
+      try { me = await pageApi.me(page); } catch (e) { log(`  ⚠️ 登录态检查失败：${e.message}`); }
+    }
+
+    emit({ ev: 'login', ok: me.ok, name: me.name, checked: me.checked, blocked: !!me.blocked });
     log(`登录态：${me.checked ? (me.ok ? `已登录${me.name ? ` (${me.name})` : ''}` : '未登录') : '未知（检查失败）'}`);
 
     // ---- 批次发现 ----
@@ -534,9 +623,23 @@ async function main() {
     try {
       items = await pageApi.discover(page);
     } catch (e) {
-      fatal('DISCOVER_FAILED', `获取批次失败：${e.message}`);
-      process.exitCode = 1;
-      return;
+      if (!e.cfBlocked) {
+        fatal('DISCOVER_FAILED', `获取批次失败：${e.message}`);
+        process.exitCode = 1;
+        return;
+      }
+      // 登录态那次没被拦、拉批次时才被拦（少见但会发生）：同样让用户去过验证，过了自动重拉
+      if (!(await waitForCfPass(page))) {
+        fatal('CF_BLOCKED', CF_TIMEOUT_HINT);
+        process.exitCode = 1;
+        return;
+      }
+      try { items = await pageApi.discover(page); }
+      catch (e2) {
+        fatal('DISCOVER_FAILED', `获取批次失败：${e2.message}`);
+        process.exitCode = 1;
+        return;
+      }
     }
     log(`  当前批次 ${items.length} 个资产：`);
     for (const it of items) log(`    · ${it.title}  (${it.uid})`);

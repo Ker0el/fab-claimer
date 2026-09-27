@@ -1,0 +1,21 @@
+{
+  "version": "1.0.0",
+  "date": "2026-09-28",
+  "notes": "首个带自更新的版本",
+  "files": [
+    "version.json",
+    "core/gui.ps1",
+    "core/browser.ps1",
+    "core/claim.mjs",
+    "core/whoami.mjs",
+    "core/open-login.mjs",
+    "core/update.mjs",
+    "core/auto-claim.cmd",
+    "core/备用启动.bat",
+    "core/fab.ico",
+    "README.md",
+    "使用说明.txt",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md"
+  ]
+}

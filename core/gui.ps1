@@ -57,6 +57,14 @@ $TaskName  = 'FabLimitedTimeFreeAutoClaim'
 # profile\ 和 settings.json 由 browser.ps1 管理（$script:BProfile / $script:BSettings），
 # 这里不再各留一份，免得两处路径哪天对不上
 
+# 版本号 —— 显示在标题下面，也用来和远端比"要不要更新"。
+# 读不到就当空（旧版本装上来的没有这个文件），绝不能因此让程序起不来。
+$script:AppVer = ''
+try {
+    $vt = [System.IO.File]::ReadAllText((Join-Path $AppRoot 'version.json')).TrimStart([char]0xFEFF)
+    $script:AppVer = [string](($vt | ConvertFrom-Json).version)
+} catch { $script:AppVer = '' }
+
 # ---------- 浏览器定位 / 启动 / 验证 ----------
 # 全部收在 browser.ps1 里，界面和计划任务共用同一份。
 # 以前这里和 auto-claim.cmd 各写了一份名单，必然漂移：界面上手动指定了
@@ -85,6 +93,13 @@ $script:WhoProc   = $null
 $script:WhoTicks  = 0
 $script:LoginProc = $null
 $script:AutoLoginDone = $false
+$script:UpdProc   = $null     # 后台查新版本
+$script:UpdApplyProc = $null  # 正在下载新版本
+$script:UpdVer    = ''        # 查到的远端版本号
+$script:UpdLocal  = ''        # 本机版本号
+$script:UpdNotes  = ''
+$script:UpdManual = $false    # 这次检查是不是用户手动点的（决定失败要不要出声）
+$script:HintIsUpdate = $false # 提示条上现在挂的是"更新"还是"登录"
 $script:Items     = [ordered]@{}   # uid -> @{Title;State;Reason}
 $script:OkCount   = 0
 $script:TodoCount = 0
@@ -217,7 +232,10 @@ function Invoke-BrowserSearch {
 
 # 保证浏览器可用。真正的逻辑都在 browser.ps1，这里只负责刷界面和在彻底失败时问用户。
 function Ensure-Browser {
-    if (Test-CdpBrowser -Port $script:BPort) { Sync-CdpPort; return $true }
+    # 复用只认"能干活、而且是我们自己启动的"浏览器 —— 判据在 browser.ps1。
+    # 这里图省事只看"端口上有没有浏览器"的话，会把别人的 headless Chrome 接过来，
+    # 那东西没窗口、也没登录态，用户看到的是「没有窗口 + 未登录 + 被 Cloudflare 拦」。
+    if ((Test-CdpReusable -Port $script:BPort).ok) { Sync-CdpPort; return $true }
     Set-Status '正在启动浏览器…' 'run'
     [System.Windows.Forms.Application]::DoEvents()
 
@@ -246,7 +264,8 @@ function Ensure-Browser {
                 continue
             }
             # 验过了才记住 —— 记住一个起不来的路径，下次启动还要白等一轮
-            Save-Settings @{ browser = $exe }
+            # cdpPid 一起记：下次靠它认"端口上那个浏览器是我们的"
+            Save-Settings @{ browser = $exe; cdpPort = $script:BPort; cdpPid = $t.proc.Id }
             Sync-CdpPort
             Add-Log "已记住这个浏览器，下次直接用：$exe" 'ok'
             Add-Log "浏览器：$($t.browser)" 'ok'
@@ -403,21 +422,35 @@ function Start-AuxNode {
 
 $script:LoginHintText = '请在弹出的浏览器窗口里登录 Epic（该窗口为本程序专用，登录一次即长期有效）'
 
+# 提示条只有一条，"请登录"和"发现新版本"会抢它。规则：登录优先 ——
+# 登录是挡在领取前面的，更新只是顺便。登录提示收起来的时候再把更新提示放回去。
 function Show-LoginHint([string]$Text) {
+    $script:HintIsUpdate = $false
     $script:LblHint.Text = $Text
     $script:LblHint.Visible = $true
 }
-function Hide-LoginHint { $script:LblHint.Visible = $false }
+function Hide-LoginHint {
+    if ($script:HintIsUpdate) { return }    # 挂着的是更新提示，别顺手收掉
+    $script:LblHint.Visible = $false
+    if ($script:UpdVer) { Show-UpdateHint }
+}
+function Show-UpdateHint {
+    if (-not $script:UpdVer) { return }
+    $script:HintIsUpdate = $true
+    $script:LblHint.Text = "发现新版本 v$($script:UpdVer)（当前 v$($script:UpdLocal)）" +
+                           " —— 点这里更新，下载完程序会自己重启"
+    $script:LblHint.Visible = $true
+}
 
-# 置顶和登录窗口天然打架：窗口一直压在最上面的话，用户切到浏览器后浏览器会藏在它后面，
-# 不熟悉电脑的人就卡死在这一步了。所以登录期间临时取消置顶，登录成功后恢复。
+# 置顶和浏览器窗口天然打架：窗口一直压在最上面的话，用户切到浏览器后浏览器会藏在它后面，
+# 不熟悉电脑的人就卡死在这一步了。所以登录/人机验证期间临时取消置顶，之后自动恢复。
 # 只在我们自己取消过的时候才恢复 —— 用户自己关掉的置顶，不许我们替他打开。
 $script:TopMostSuspended = $false
 function Suspend-TopMostForLogin {
     if (-not $chkTop.Checked) { return }
     $script:TopMostSuspended = $true
     $chkTop.Checked = $false          # 勾选框跟着走，免得界面显示的和实际状态对不上
-    Add-Log '已临时取消窗口置顶，免得挡住登录窗口；登录成功后会自动恢复。'
+    Add-Log '已临时取消窗口置顶，免得挡住浏览器窗口；之后会自动恢复。'
 }
 function Restore-TopMostAfterLogin {
     if (-not $script:TopMostSuspended) { return }
@@ -448,6 +481,33 @@ function Check-LoginNow {
     $script:WhoProc = Start-AuxNode -ScriptFile (Join-Path $Core 'whoami.mjs') -Tag 'FabWho'
 }
 
+# ---------- 自更新 ----------
+# 只查、不自动装：查到新版本就在提示条上问一句，用户点了才下载。
+# 全程用后台 node 进程跑，界面不卡；查不到（离线、GitHub 不通）就安静跳过 ——
+# 绝不能因为"查更新失败"影响到正常领取。
+function Start-UpdateCheck([switch]$Manual) {
+    if ($script:UpdProc -and -not $script:UpdProc.HasExited) { return }
+    $script:UpdManual = [bool]$Manual
+    if ($Manual) {
+        Set-Status '正在检查更新…' 'run'
+        Add-Log '正在检查更新…'
+    }
+    $script:UpdProc = Start-AuxNode -ScriptFile (Join-Path $Core 'update.mjs') -Tag 'FabUpd' -ExtraArgs '--check'
+}
+
+function Invoke-Update {
+    if ($script:Busy) { return }
+    if ($script:UpdApplyProc -and -not $script:UpdApplyProc.HasExited) { return }
+    $script:HintIsUpdate = $false
+    $script:LblHint.Visible = $false
+    Set-Status "正在下载新版本 v$($script:UpdVer)…" 'run'
+    Add-Log "正在下载新版本 v$($script:UpdVer)…" 'head'
+    Add-Log '  下载完程序会自己重启，界面会闪一下，属于正常。' 'head'
+    # --parent 把自己这个进程号交给它：下载完由它拉起的独立进程等本界面退出，
+    # 再覆盖文件、重新启动。覆盖自己正在跑的代码这一步，必须等界面退干净。
+    $script:UpdApplyProc = Start-AuxNode -ScriptFile (Join-Path $Core 'update.mjs') -Tag 'FabUpdApply' -ExtraArgs "--apply --parent $PID"
+}
+
 # ================= 事件处理 =================
 
 function Handle-Event($e) {
@@ -465,6 +525,9 @@ function Handle-Event($e) {
                 Set-Status "已登录 Epic：$name" 'ok'
                 Add-Log "已登录：$name" 'ok'
                 $script:BtnBrowser.Text = '打开浏览器'
+            } elseif ($e.blocked) {
+                # 被 Cloudflare 拦了，不是没登录 —— 等会儿的 challenge 事件会给专门提示，
+                # 这里不能按"未登录"处理（那会弹登录页，把用户带偏）
             } elseif ($e.checked -eq $false) {
                 # 检查本身没成功（页面正在跳转/上下文被销毁），不是"未登录"。
                 # 关键：不能在这里把 $script:LoggedIn 改成 false —— 那会把上一秒
@@ -532,6 +595,38 @@ function Handle-Event($e) {
         'fatal' {
             Add-Log "出错：$($e.text)" 'err'
             Set-Status $e.text 'err'
+            # FabExit 里靠这个标记避免把刚显示的错误状态盖成「就绪」——
+            # 之前只读不写，等于白写：出错后状态栏一秒就被覆盖掉了
+            $script:HadFatal = $true
+        }
+        'challenge' {
+            # Cloudflare 人机验证。跟登录一样是「需要用户动一下手」，不是错误 ——
+            # 主流程会在那边等着，过了自动继续，所以这里只负责把话说明白。
+            if ($e.ok) {
+                Hide-LoginHint
+                Restore-TopMostAfterLogin
+                Set-Status '人机验证已通过，继续…' 'run'
+                Add-Log '人机验证已通过。' 'ok'
+            } elseif ($e.timeout) {
+                # 已经放弃了，置顶得还回去，否则界面永远浮在最上面
+                Restore-TopMostAfterLogin
+            } elseif ($e.sec) {
+                # 等待中的心跳：只更新提示，不重复刷日志
+                Show-LoginHint "等待人机验证 —— 请切到浏览器窗口点一下「确认您是真人」（已等待 $($e.sec) 秒）"
+            } else {
+                Suspend-TopMostForLogin
+                Set-Status '等待人机验证 —— 请到浏览器窗口点一下' 'err'
+                # 步骤同样一条条写清楚：这段文字出现的时刻，用户多半正一头雾水
+                # （上一次操作还好好的，怎么突然就报错了）
+                Add-Log 'Fab 的人机验证拦住了这次请求（不是你操作错了，也不是没登录）。' 'err'
+                Add-Log '  ① 切到浏览器窗口（就是本程序打开的那个专用窗口）' 'head'
+                Add-Log '  ② 页面上会出现「确认您是真人」的验证框，点一下' 'head'
+                Add-Log '     如果只显示「请稍候…」，等几秒它自己会出来' 'head'
+                Add-Log '  ③ 点完什么都不用做 —— 程序每 5 秒自动检查一次，' 'head'
+                Add-Log '     一通过就会自己接着领取' 'head'
+                Add-Log '  要是超过 5 分钟还没过，程序会先停下；验证完点「刷新批次」即可。' 'head'
+                Show-LoginHint '等待人机验证 —— 请切到浏览器窗口点一下「确认您是真人」'
+            }
         }
         'log' { }   # 详细日志已由脚本自身写入 logs\，界面不刷屏
     }
@@ -640,6 +735,63 @@ function Drain-ProcessEvents {
     foreach ($e in @(Get-Event -SourceIdentifier 'FabLoginExit' -ErrorAction SilentlyContinue)) {
         Remove-Event -EventIdentifier $e.EventIdentifier -ErrorAction SilentlyContinue
     }
+
+    # ---- 辅助进程：检查更新 ----
+    foreach ($e in @(Get-Event -SourceIdentifier 'FabUpdOut' -ErrorAction SilentlyContinue)) {
+        $line = $e.SourceEventArgs.Data
+        Remove-Event -EventIdentifier $e.EventIdentifier -ErrorAction SilentlyContinue
+        if (-not $line) { continue }
+        try { $o = $line | ConvertFrom-Json } catch { continue }
+        $manual = $script:UpdManual
+        $script:UpdManual = $false
+        if (-not $o.ok) {
+            # 后台那次查不到就安静跳过（离线、GitHub 不通都算正常，不能吓用户）；
+            # 用户自己点的那次要给个说法，否则他以为按钮坏了
+            if ($manual) {
+                Add-Log "检查更新失败：$($o.error)（不影响正常领取）" 'warn'
+                Set-Status '检查更新失败（多半是网络不通或 GitHub 访问不了）' 'warn'
+            }
+        } elseif (-not $o.update) {
+            $script:UpdLocal = [string]$o.local
+            if ($manual) {
+                Add-Log "已经是最新版本（v$($o.local)）" 'ok'
+                Set-Status "已经是最新版本（v$($o.local)）" 'ok'
+            }
+        } else {
+            $script:UpdVer   = [string]$o.remote
+            $script:UpdLocal = [string]$o.local
+            $script:UpdNotes = [string]$o.notes
+            Add-Log "发现新版本 v$($o.remote)（当前 v$($o.local)）" 'head'
+            if ($o.notes) { Add-Log "  更新内容：$($o.notes)" 'head' }
+            Add-Log '  点上方黄色提示条即可更新，下载完程序会自己重启。' 'head'
+            if (-not $script:LblHint.Visible) { Show-UpdateHint }
+        }
+    }
+    foreach ($e in @(Get-Event -SourceIdentifier 'FabUpdExit' -ErrorAction SilentlyContinue)) {
+        Remove-Event -EventIdentifier $e.EventIdentifier -ErrorAction SilentlyContinue
+    }
+
+    # ---- 辅助进程：下载新版本 ----
+    foreach ($e in @(Get-Event -SourceIdentifier 'FabUpdApplyOut' -ErrorAction SilentlyContinue)) {
+        $line = $e.SourceEventArgs.Data
+        Remove-Event -EventIdentifier $e.EventIdentifier -ErrorAction SilentlyContinue
+        if (-not $line) { continue }
+        try { $o = $line | ConvertFrom-Json } catch { continue }
+        if ($o.ok) {
+            Add-Log "新版本 v$($o.version) 已下载（$($o.count) 个文件），正在重启程序…" 'ok'
+            Set-Status '更新已就绪，正在重启程序…' 'ok'
+            [System.Windows.Forms.Application]::DoEvents()
+            # 剩下的交给它自己拉起的独立进程：等这个界面退出→覆盖文件→重开。
+            $form.Close()
+            return
+        }
+        Add-Log "更新失败：$($o.error)（不影响正常领取）" 'err'
+        Set-Status '更新失败（不影响正常领取）' 'err'
+        if ($script:UpdVer) { Show-UpdateHint }   # 让用户还能再点一次
+    }
+    foreach ($e in @(Get-Event -SourceIdentifier 'FabUpdApplyExit' -ErrorAction SilentlyContinue)) {
+        Remove-Event -EventIdentifier $e.EventIdentifier -ErrorAction SilentlyContinue
+    }
 }
 
 # ================= 界面 =================
@@ -673,6 +825,7 @@ $form.Controls.Add($lblTitle)
 
 $lblSub = New-Object System.Windows.Forms.Label
 $lblSub.Text = '自动领取 fab.com 上轮换的限时免费资产（原价收费、限时 100% 折扣）'
+if ($script:AppVer) { $lblSub.Text += "　　v$($script:AppVer)" }
 $lblSub.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 130)
 $lblSub.Location = New-Object System.Drawing.Point(20, 42)
 $lblSub.AutoSize = $true
@@ -714,8 +867,12 @@ $script:LblHint.Visible = $false
 $form.Controls.Add($script:LblHint)
 # 点提示条 = 把登录窗口重新调到前面。用户很容易把浏览器窗口弄丢，
 # 而"点这条提示"比"去别处找某个按钮"更符合直觉。
+# 挂着"发现新版本"的时候，点它就是更新 —— 同一块地方，一次只挂一件事。
 $script:LblHint.Cursor = [System.Windows.Forms.Cursors]::Hand
-$script:LblHint.Add_Click({ if (-not $script:LoggedIn) { Invoke-Login } })
+$script:LblHint.Add_Click({
+    if ($script:HintIsUpdate) { Invoke-Update; return }
+    if (-not $script:LoggedIn) { Invoke-Login }
+})
 
 # --- 批次列表 ---
 $script:LblBatch = New-Object System.Windows.Forms.Label
@@ -807,6 +964,14 @@ $btnClaimed.Text = '已领取记录'
 $btnClaimed.Anchor = 'Bottom,Left'
 $form.Controls.Add($btnClaimed)
 
+# 手动查更新的入口。启动时那次自动检查是静默的 —— 国内直连 GitHub 经常不通，
+# 静默失败的话这个功能等于不存在；留个按钮，至少点了能看到失败原因。
+$btnUpdCheck = New-Object System.Windows.Forms.Button
+$btnUpdCheck.Text = '检查更新'
+$btnUpdCheck.Anchor = 'Bottom,Left'
+$form.Controls.Add($btnUpdCheck)
+$btnUpdCheck.Add_Click({ Start-UpdateCheck -Manual })
+
 # --- 自适应布局 ---
 function Update-Layout {
     $w = $form.ClientSize.Width
@@ -843,6 +1008,8 @@ function Update-Layout {
 
     $btnClaimed.Location = New-Object System.Drawing.Point($pad, ($h - 44))
     $btnClaimed.Size     = New-Object System.Drawing.Size(120, 32)
+    $btnUpdCheck.Location = New-Object System.Drawing.Point(($pad + 128), ($h - 44))
+    $btnUpdCheck.Size     = New-Object System.Drawing.Size(120, 32)
 }
 $form.Add_Resize({ Update-Layout })
 Update-Layout
@@ -1082,13 +1249,17 @@ $form.Add_FormClosing({
     $timer.Stop()
     $loginTimer.Stop()
     # 必须清掉所有子进程，否则 node 会在后台留着（尤其 whoami 每 5 秒一次）
-    foreach ($p in @($script:Proc, $script:WhoProc, $script:LoginProc)) {
+    # 注意**不要**把 --commit 那个进程算进来：它本来就该活过本进程，
+    # 干的就是"等界面退出→覆盖文件→重开"这件事。
+    foreach ($p in @($script:Proc, $script:WhoProc, $script:LoginProc, $script:UpdProc, $script:UpdApplyProc)) {
         if ($p -and $p.HasExited -eq $false) { try { $p.Kill() } catch {} }
     }
 })
 
 $form.Add_Shown({
     $chk.Checked = Get-TaskEnabled
+    # 查更新放最前面：它是个后台进程，不挡后面的启动流程，早点发出去早点有结果
+    Start-UpdateCheck
     $chkAuto.Enabled = $chk.Checked
     $chkAuto.Checked = Get-TaskLogonTrigger   # 按计划任务里实际有没有登录触发器来显示
     $foreign = Get-TaskForeignPath
