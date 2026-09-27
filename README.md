@@ -17,7 +17,18 @@
 
 ## 快速开始
 
-1. 下载整个文件夹（或 Release 包）
+**方式一：装安装包（推荐）**
+
+1. 从[仓库](https://github.com/Ker0el/fab-claimer)或 Release 下载 `FabClaimer-Setup-x.y.z.exe`
+2. 双击安装（**不需要管理员权限**），装完自动启动
+3. 第一次会弹出一个浏览器窗口，在里面登录一次 Epic 账号即可，以后自动记住
+
+装到 `%LOCALAPPDATA%\Programs\FabClaimer`，卸载走「设置 → 应用」，
+卸载时会问你要不要连登录状态一起删。
+
+**方式二：直接用免安装版**
+
+1. 下载整个文件夹（或 clone 仓库）
 2. 双击 `Fab领取助手.exe`
 3. 第一次会弹出一个浏览器窗口，在里面登录一次 Epic 账号即可，以后自动记住
 
@@ -55,7 +66,34 @@ core\                  程序本体
   备用启动.bat          exe 被拦截时的备用入口
 profile\               浏览器配置，登录态存这里（**不会进仓库**，见下）
 logs\                  运行日志
+installer\             打包成安装程序（开发用，不影响运行）
+  build.ps1            构建入口：挑文件 → 自检 → 调 ISCC
+  fab-claimer.iss      Inno Setup 脚本
 ```
+
+## 打包安装程序
+
+```
+powershell -ExecutionPolicy Bypass -File installer\build.ps1
+```
+
+产物在 `installer\Output\FabClaimer-Setup-<版本>.exe`，约 26 MB（未压缩约 102 MB，
+大头是 `node.exe`）。需要本机装了 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。
+
+**这个脚本存在的唯一理由是防一件事：把 `profile\` 打进安装包。**
+那是真实 Epic 登录凭据（216 MB），和"绝不能进公开仓库"是同一件事，
+而且安装包发出去撤不回来。所以它不依赖 Inno 的 `Excludes`（写错一个字不报错，
+只会安静地打进去），而是：
+
+1. **白名单复制**到 `_stage\` —— 根目录的文件一个个点名，不写"除了这些全都发"
+2. **自己数一遍**：`profile\`、`logs\`、`settings.json`、`cdp-port.txt` 任何一个
+   出现就直接失败；还会全树搜 `Cookies` / `Login Data` / `Web Data` 这类文件名
+3. `.iss` 里还有一道**编译期硬闸**（ISPP `#error`）兜底，改坏排除规则也拦得住
+
+装到 `%LOCALAPPDATA%\Programs` 而不是 Program Files，是必须的而不是偏好：程序把
+`profile\`、日志、领取记录都写在**程序目录旁边**，装到 Program Files 不可写，
+Chrome 存不下登录态；而且自动更新要往 `core\` 里写文件，那需要管理员权限，
+后台更新弹不出提权框，等于永远更新不了。
 
 ## 自动更新
 

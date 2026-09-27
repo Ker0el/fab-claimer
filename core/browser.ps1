@@ -452,6 +452,20 @@ function Ensure-BrowserWork {
         $script:BPort = (Resolve-FreePort -Start ($script:BPort + 1)).Port
         $result.port = $script:BPort
         & $say "改用端口 $($script:BPort)"
+
+        # ★ 换过去的端口上**可能已经有浏览器了**：最典型的是同一个程序装在另一个
+        # 文件夹里（绿色版 + 安装版），它的浏览器正好占着这个端口。
+        # 这种情况必须复用，绝不能直接往下走去启动新的 —— Chromium 遇到端口被占
+        # 不会报错，只会静默地不开调试端口，结果是：连上的是别人的浏览器、
+        # 却把自己那个连不上的僵尸进程记成"我们的浏览器"，白留一个 Chrome 在后台。
+        $re2 = Test-CdpReusable -Port $script:BPort
+        if ($re2.ok) {
+            $info2 = Get-CdpInfo -Port $script:BPort
+            & $say "已连接到正在运行的浏览器（$($info2.Browser)）"
+            $result.ok = $true; $result.browser = [string]$info2.Browser; $result.source = '已在运行'
+            Clear-BError
+            return $result
+        }
     }
     # 端口被非浏览器占着：Chromium 遇到端口被占不会报错，只会静默地不开调试端口，
     # 一路看下来就是"浏览器起不来"。换个端口比在这上面耗着强。

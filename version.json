@@ -1,7 +1,7 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "date": "2026-09-28",
-  "notes": "更新时的报错说清楚一点：刚发版、CDN 还没同步完的时候，别再把「远端还是旧版本」说成「已经是最新版本」",
+  "notes": "换端口之后忘了再看一眼新端口——同一个程序装在两个文件夹里时，它会连上别人的浏览器、还留下一个连不上的僵尸 Chrome。另加 Inno Setup 安装包（installer\\build.ps1）",
   "files": [
     "version.json",
     "core/gui.ps1",

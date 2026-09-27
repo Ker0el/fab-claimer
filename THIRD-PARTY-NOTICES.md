@@ -45,3 +45,38 @@ Microsoft Corporation 出品，Apache License 2.0。
 
 本程序**不包含**任何浏览器二进制。它只是在运行时调用用户自己机器上已安装的
 Chromium 内核浏览器。相关商标归 Microsoft / Google 各自所有。
+
+## Inno Setup 简体中文语言包 (`installer/ChineseSimplified.isl`)
+
+只用于**构建**安装程序（`installer\build.ps1`），文案会被编译进安装界面。
+Inno Setup 6 自带 29 种语言，其中**没有中文**，所以需要单独带一份。
+
+来源：<https://github.com/kira-96/Inno-Setup-Chinese-Simplified-Translation>
+（MIT 许可证，维护者 Zhenghan Yang (Kira)）。文件头部的署名信息原样保留，未做修改。
+
+```
+MIT License
+
+Copyright (c) 2019 - 2020 kirakira
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+安装程序本身由 [Inno Setup](https://jrsoftware.org/isinfo.php) 编译（构建工具，
+不随程序分发）。
