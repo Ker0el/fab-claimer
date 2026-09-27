@@ -143,7 +143,13 @@ async function check() {
 
 async function apply(parentPid) {
   const c = await check();
-  if (!c.update) return { ok: false, error: `已经是最新版本（v${c.local}）` };
+  // 这里要重新 check 一次（下载前再确认一遍），于是可能和界面刚才 --check 的结果不一致：
+  // 刚 push 完的一两分钟里，CDN 会在新旧之间来回翻，同一个版本号问两次可能一个说
+  // "有新版"、一个说"已经最新"。别写成"已经是最新版本" —— 那会让人以为程序坏了。
+  if (!c.update) {
+    return { ok: false, error: `远端这会儿报告的是 v${c.remote}，不比本机的 v${c.local} 新。` +
+                              `刚发版的话多半是 CDN 还没同步完，过一两分钟再点一次。` };
+  }
 
   const remote = await getJson(`${BASE}/version.json`);
   const listed = Array.isArray(remote?.files) ? remote.files.map(String) : [];
