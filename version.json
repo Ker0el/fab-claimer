@@ -1,7 +1,7 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "date": "2026-09-28",
-  "notes": "首个带自更新的版本",
+  "notes": "更新器修两个实测出来的问题：下载失败会重试；.cmd/.bat/.ps1 补回 CRLF 行尾（GitHub 存的是 LF，不补的话计划任务的批处理会坏）",
   "files": [
     "version.json",
     "core/gui.ps1",

@@ -82,22 +82,51 @@ function isNewer(remote, local) {
 }
 
 // ---------- 网络 ----------
+// 国内直连 GitHub 抖是常态，一次超时就让整轮更新作废太亏 —— 每个请求重试几次。
+async function withRetry(label, fn, tries = 3) {
+  let last;
+  for (let i = 1; i <= tries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      last = e;
+      if (i < tries) await sleep(700 * i);
+    }
+  }
+  throw new Error(`${label}失败（试了 ${tries} 次）：${last?.message || last}`);
+}
+
 async function getJson(url) {
   // 加时间戳绕过 raw.githubusercontent 的缓存，否则刚发的版本可能半小时拿不到
-  const r = await fetch(`${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`,
-    { signal: AbortSignal.timeout(TIMEOUT_MS), headers: { 'cache-control': 'no-cache' } });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return await r.json();
+  return await withRetry('获取版本信息', async () => {
+    const r = await fetch(`${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`,
+      { signal: AbortSignal.timeout(TIMEOUT_MS), headers: { 'cache-control': 'no-cache' } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  });
 }
 
 async function getBuf(url) {
-  const r = await fetch(`${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`,
-    { signal: AbortSignal.timeout(TIMEOUT_MS) });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return Buffer.from(await r.arrayBuffer());
+  return await withRetry('下载文件', async () => {
+    const r = await fetch(`${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`,
+      { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return Buffer.from(await r.arrayBuffer());
+  });
 }
 
 const fileUrl = (rel) => `${BASE}/${rel.split('/').map(encodeURIComponent).join('/')}`;
+
+// ★ 行尾要自己补回来。
+// GitHub 上存的是 blob 原样字节（LF），raw 接口**不会**做 git checkout 时的行尾转换 ——
+// 而 .gitattributes 里明明写着 *.cmd / *.bat / *.ps1 要 eol=crlf，因为批处理是 LF 会
+// 直接坏掉（仓库里那条 "Must stay ASCII + CRLF" 的红线就是这么来的）。
+// 实测确认过：不补的话，更新下来 auto-claim.cmd 会变成纯 LF。
+// 这里就照 .gitattributes 的三条规则做，别的文件原样不动。
+function normalizeEol(rel, buf) {
+  if (!/\.(cmd|bat|ps1)$/i.test(rel)) return buf;
+  const s = buf.toString('utf8').replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+  return Buffer.from(s, 'utf8');   // 有 BOM 的 .ps1 也照原样带回来
+}
 
 // ---------- 三步 ----------
 async function check() {
@@ -121,17 +150,36 @@ async function apply(parentPid) {
   const files = listed.filter(isUpdatable);
   const refused = listed.filter((p) => !isUpdatable(p));
   if (!files.length) return { ok: false, error: '远端清单里没有可更新的文件' };
+  // version.json 必须在清单里：下面要靠它验"这一轮下载有没有新老混在一起"
+  if (!files.includes('version.json')) {
+    return { ok: false, error: '远端清单里没有 version.json，没法确认版本，先不更新' };
+  }
 
   const stage = path.join(ROOT, 'logs', `update-${c.remote}`);
   fs.rmSync(stage, { recursive: true, force: true });
 
   // 全部下到暂存区，一个失败就整个作废 —— 绝不留下半个新版本
   for (const rel of files) {
-    const buf = await getBuf(fileUrl(rel));
+    const buf = normalizeEol(rel, await getBuf(fileUrl(rel)));
     const dest = path.join(stage, rel);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.writeFileSync(dest, buf);
   }
+
+  // 刚 push 完的一两分钟里，GitHub 的 CDN 有传播延迟：不同文件可能一个新一个旧。
+  // 下下来的 version.json 如果对不上号，说明这轮是"混的"，作废重来 ——
+  // 否则会留下"版本号是新的、代码是旧的"，而且因为版本号已经追平，以后永远不会再更新。
+  try {
+    const staged = JSON.parse(fs.readFileSync(path.join(stage, 'version.json'), 'utf8'));
+    if (String(staged.version || '') !== c.remote) {
+      fs.rmSync(stage, { recursive: true, force: true });
+      return { ok: false, error: `下载到的版本对不上（期望 v${c.remote}，拿到 v${staged.version}）—— 多半是刚发版、CDN 还没同步，过两分钟再试` };
+    }
+  } catch (e) {
+    fs.rmSync(stage, { recursive: true, force: true });
+    return { ok: false, error: `暂存下来的 version.json 读不出来：${e.message}` };
+  }
+
   // 给 commit 阶段留一份清单：那边照着搬，不再信一次网络
   fs.writeFileSync(path.join(stage, '_manifest.json'),
     JSON.stringify({ version: c.remote, files }, null, 2));
@@ -201,4 +249,10 @@ try {
 
 // --commit 是脱离界面跑的，没人读它的输出；其余情况输出一行 JSON 给界面
 if (!has('--commit')) process.stdout.write(JSON.stringify(out) + '\n');
-process.exit(out.ok ? 0 : 1);
+
+// ★ 这里**不能**调 process.exit()。
+// fetch 的 socket 还在收尾，硬退会在 Windows 上触发 libuv 的
+// "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)"，进程带着 exit=127 崩掉，
+// 那行断言还会走 stderr —— 界面把 stderr 当"内部错误"显示，用户就会看到一条
+// 莫名其妙的报错。让事件循环自然排空即可，这里没有会吊住它的常驻句柄。
+process.exitCode = out.ok ? 0 : 1;
