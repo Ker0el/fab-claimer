@@ -1,0 +1,15 @@
+# core\auto-claim.cmd 和 备用启动.bat 里写明了 "Must stay ASCII + CRLF"。
+# git 默认会把行尾统一成 LF，那样克隆下来批处理会直接坏掉（症状很隐蔽：
+# 文件看着正常，运行时行为诡异）。这里按类型钉死行尾，别依赖各人的
+# core.autocrlf 设置 —— 那个默认值在 Windows 和 Linux 上不一样。
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# 二进制文件一律不碰，免得 git 试图做行尾转换或增量压缩
+*.exe  binary
+*.ico  binary
+*.dll  binary
+
+# 大文件别尝试生成 diff
+core/node.exe  binary
