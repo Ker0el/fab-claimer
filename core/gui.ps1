@@ -92,6 +92,7 @@ $script:LoginName = ''
 $script:WhoProc   = $null
 $script:WhoTicks  = 0
 $script:LoginProc = $null
+$script:FrontProc = $null     # 只是把浏览器窗口调到前面（点提示条时用）
 $script:AutoLoginDone = $false
 $script:UpdProc   = $null     # 后台查新版本
 $script:UpdApplyProc = $null  # 正在下载新版本
@@ -100,6 +101,7 @@ $script:UpdLocal  = ''        # 本机版本号
 $script:UpdNotes  = ''
 $script:UpdManual = $false    # 这次检查是不是用户手动点的（决定失败要不要出声）
 $script:HintIsUpdate = $false # 提示条上现在挂的是"更新"还是"登录"
+$script:HintIsBrowser = $false # 挂的是"去浏览器点一下"（点提示条 = 把浏览器窗口调到前面）
 $script:Items     = [ordered]@{}   # uid -> @{Title;State;Reason}
 $script:OkCount   = 0
 $script:TodoCount = 0
@@ -424,19 +426,22 @@ $script:LoginHintText = '请在弹出的浏览器窗口里登录 Epic（该窗�
 
 # 提示条只有一条，"请登录"和"发现新版本"会抢它。规则：登录优先 ——
 # 登录是挡在领取前面的，更新只是顺便。登录提示收起来的时候再把更新提示放回去。
-function Show-LoginHint([string]$Text) {
+function Show-LoginHint([string]$Text, [switch]$Browser) {
     $script:HintIsUpdate = $false
+    $script:HintIsBrowser = [bool]$Browser
     $script:LblHint.Text = $Text
     $script:LblHint.Visible = $true
 }
 function Hide-LoginHint {
     if ($script:HintIsUpdate) { return }    # 挂着的是更新提示，别顺手收掉
     $script:LblHint.Visible = $false
+    $script:HintIsBrowser = $false
     if ($script:UpdVer) { Show-UpdateHint }
 }
 function Show-UpdateHint {
     if (-not $script:UpdVer) { return }
     $script:HintIsUpdate = $true
+    $script:HintIsBrowser = $false
     $script:LblHint.Text = "发现新版本 v$($script:UpdVer)（当前 v$($script:UpdLocal)）" +
                            " —— 点这里更新，下载完程序会自己重启"
     $script:LblHint.Visible = $true
@@ -466,6 +471,13 @@ function Invoke-Login {
     Set-Status '未登录 —— 正在打开 Epic 登录页面…' 'run'
     Show-LoginHint $script:LoginHintText
     $script:LoginProc = Start-AuxNode -ScriptFile (Join-Path $Core 'open-login.mjs') -Tag 'FabLogin'
+}
+
+# 只把浏览器窗口调到前面，不开任何页面 —— 结账页要求完成安全检查时，用户要回到
+# 正是已经开着的那一个标签页（结账框就在里面），把他带去别处反而找不到验证框。
+function Invoke-BrowserFront {
+    if ($script:FrontProc -and -not $script:FrontProc.HasExited) { return }
+    $script:FrontProc = Start-AuxNode -ScriptFile (Join-Path $Core 'open-login.mjs') -Tag 'FabFront' -ExtraArgs '--front'
 }
 
 # 每 5 秒探一次登录态
@@ -600,9 +612,33 @@ function Handle-Event($e) {
             $script:HadFatal = $true
         }
         'challenge' {
-            # Cloudflare 人机验证。跟登录一样是「需要用户动一下手」，不是错误 ——
-            # 主流程会在那边等着，过了自动继续，所以这里只负责把话说明白。
-            if ($e.ok) {
+            # 需要用户自己动手的两件事：Cloudflare 人机验证、结账页的安全检查。
+            # 都跟登录一样是「需要用户动一下手」，不是错误 —— 主流程会在那边等着，
+            # 用户弄完自动继续，所以这里只负责把话说明白。
+            if ($e.kind -eq 'checkout') {
+                if ($e.ok) {
+                    Hide-LoginHint
+                    Restore-TopMostAfterLogin
+                    Set-Status '安全检查已通过，继续…' 'run'
+                    Add-Log '安全检查已通过。' 'ok'
+                } elseif ($e.timeout) {
+                    # 已经放弃了，置顶得还回去，否则界面永远浮在最上面
+                    Restore-TopMostAfterLogin
+                } elseif ($e.sec) {
+                    # 等待中的心跳：只更新提示，不重复刷日志
+                    Show-LoginHint "等待安全检查 —— 请切到浏览器窗口点一下（已等待 $($e.sec) 秒）" -Browser
+                } else {
+                    Suspend-TopMostForLogin
+                    Set-Status '等待安全检查 —— 请到浏览器窗口点一下' 'err'
+                    Add-Log '结账页上弹出了一个安全检查（不是你操作错了，也不是没登录）。' 'err'
+                    Add-Log '  ① 切到浏览器窗口（点下面那条提示，就能把浏览器调到前面）' 'head'
+                    Add-Log '  ② 结账页上有个验证框，点一下完成验证' 'head'
+                    Add-Log '  ③ 点完什么都不用做 —— 程序每 5 秒自动检查一次，' 'head'
+                    Add-Log '     一通过就会自己接着领取' 'head'
+                    Add-Log '  要是超过 5 分钟还没过，程序会先停下；验证完点一次「一键领取」即可。' 'head'
+                    Show-LoginHint '等待安全检查 —— 请切到浏览器窗口点一下（点这里把浏览器调到前面）' -Browser
+                }
+            } elseif ($e.ok) {
                 Hide-LoginHint
                 Restore-TopMostAfterLogin
                 Set-Status '人机验证已通过，继续…' 'run'
@@ -871,6 +907,8 @@ $form.Controls.Add($script:LblHint)
 $script:LblHint.Cursor = [System.Windows.Forms.Cursors]::Hand
 $script:LblHint.Add_Click({
     if ($script:HintIsUpdate) { Invoke-Update; return }
+    # 挂着"去浏览器点一下"的时候，点它就把浏览器窗口调到前面 —— 这正是用户此刻要做的事
+    if ($script:HintIsBrowser) { Invoke-BrowserFront; return }
     if (-not $script:LoggedIn) { Invoke-Login }
 })
 

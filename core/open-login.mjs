@@ -3,6 +3,8 @@
  * 把浏览器带到前台并打开 Epic 登录页，让用户完成登录。
  *   （无参数）  打开 Epic 登录页
  *   --fab      只是把 fab.com 打开（已登录时「打开浏览器」用）
+ *   --front    只把浏览器窗口调到前面，不打开 / 不导航任何页面
+ *              （结账页要求做安全检查时用：用户要回到的正是当前那个标签页）
  * 输出一行 JSON：{"ok":bool,"created":bool,"error":string|null}
  */
 import { chromium } from 'playwright-core';
@@ -11,6 +13,7 @@ const CDP = process.env.FAB_CDP || 'http://127.0.0.1:9222';
 // Epic 标准登录入口；登录成功后会跳回 fab.com 并把登录态写进该浏览器配置
 const LOGIN = 'https://www.epicgames.com/id/login?redirectUrl=https%3A%2F%2Fwww.fab.com%2F';
 const IS_FAB = process.argv.includes('--fab');
+const IS_FRONT = process.argv.includes('--front');
 const TARGET = IS_FAB ? 'https://www.fab.com/' : LOGIN;
 const out = { ok: false, created: false, error: null };
 
@@ -24,7 +27,12 @@ try {
   const ctx = browser.contexts()[0];
   let page;
 
-  if (IS_FAB) {
+  if (IS_FRONT) {
+    // 不开新页、不导航 —— 结账框就在当前这个标签里，跳走反而找不着了
+    page = ctx.pages().find((p) => isFab(urlOf(p))) || ctx.pages()[0];
+    if (!page) out.error = '浏览器里没有可用的标签页';
+    else await page.bringToFront().catch(() => {});
+  } else if (IS_FAB) {
     // 已登录，只是想把 fab.com 打开
     page = ctx.pages().find((p) => isFab(urlOf(p)));
     if (!page) { page = await ctx.newPage(); out.created = true; }

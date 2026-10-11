@@ -160,22 +160,31 @@ function fatal(code, text) {
   log(`❌ ${text}`);
 }
 
-/** 把脚本内部的技术性失败原因翻译成小白能看懂的中文 */
+/**
+ * 把脚本内部的技术性失败原因翻译成小白能看懂的中文。
+ *
+ * ★ 顺序很重要，别随手往下挪。info 是「A: … / B: …」拼起来的一整串，而 A 通路那条
+ *   `{"detail":{"offerId":["Not free."]}}` 是**限免商品的常态**（见下面 SEC 段的说明），
+ *   它一排在前面，B 侧真正有用的原因（卡在安全检查 / 没找到按钮 / 复核没通过）
+ *   就永远轮不到 —— 用户看到的是"属正常"，却挂着"领取失败"，只会来问这是在说什么。
+ *   （2026-10-11 用户反馈的就是这一条。）
+ *   所以：**先挑 B 侧的具体原因，Not free 只留作最后兜底，且不改写结论。**
+ */
 function friendlyReason(info) {
   const s = String(info || '');
   if (!s) return '未知原因';
-  if (/Not free/i.test(s)) return '接口直领通道不支持限免商品（属正常，已自动改用真实点击方式）';
-  if (s === 'no-cta') return '商品页上没找到「领取」按钮，可能页面改版了';
-  if (s === 'no-place-order') return '结账页面没找到「Add to library」按钮，可能页面改版了';
-  if (/未确认成功/.test(s)) return '结账没走完，可能是验证码没通过 —— 可以打开浏览器窗口手动领取一次';
+  if (SEC_MARK.test(s)) return '结账页要求先完成安全检查（人机验证）—— 请到浏览器窗口点一下，再重新领取';
+  if (/未确认成功/.test(s)) return '结账没走完，可能是验证码或安全检查没通过 —— 打开浏览器窗口手动领取一次最稳妥';
+  if (/no-cta/.test(s)) return '商品页上没找到「领取」按钮，可能页面改版了';
+  if (/no-place-order/.test(s)) return '结账页面没找到「Add to library」按钮，可能页面改版了';
   // 必须排在 401/403 那条前面：挑战页里也带 "HTTP 403"，混在一起会把风控说成掉登录
   if (CF_MARK.test(s)) return '被 Cloudflare 人机验证拦住了 —— 请到浏览器窗口完成验证后重试';
   if (/HTTP 401|HTTP 403/.test(s)) return '登录状态失效了，请重新登录 Epic 账号';
   if (/HTTP 429/.test(s)) return '请求太频繁被限流，等几分钟再试';
   if (/复核未通过/.test(s)) return '结账后没能确认入库，请打开 Fab 网站手动看一眼';
-  if (/no-cta|找不到主操作按钮/.test(s)) return '商品页没找到领取按钮，可能页面改版了';
+  if (DETACH_ERR.test(s)) return '结账窗口中途刷新，操作被打断了 —— 重试一次通常就好';
   if (/异常/.test(s)) return '网络或浏览器出现异常';
-  if (/add-to-library/.test(s)) return '接口直领失败（已自动改用真实点击方式）';
+  if (/Not free/i.test(s)) return '限时免费商品走不了接口直领（属正常），改走真实点击后这次也没成功';
   return s.slice(0, 150);
 }
 
@@ -303,6 +312,10 @@ async function assertChromeUp() {
 // "Execution context was destroyed"；在途的 fetch 则会被中断成 "Failed to fetch"。
 // 这两类都是暂时的，重试即可；其它错误（真没登录、网络断了）直接往上抛。
 const NAV_ERR = /Execution context was destroyed|because of a navigation|Target closed|detached|Cannot find context|Failed to fetch/i;
+// 结账 iframe 自己刷新时，Playwright 手里的 Frame 会失效，之后任何 locator/evaluate 都报
+// "Frame was detached"。和 NAV_ERR 是同一类"刷新中的暂时状态"：重找一遍就行，不是失败。
+// （2026-10-07 实测：通路 B 就是这么挂掉的 —— B: 异常 locator.count: Frame was detached）
+const DETACH_ERR = /detached|Execution context was destroyed|Target closed|Cannot find context/i;
 async function evalRetry(page, fn, arg, tries = 4) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
@@ -371,6 +384,50 @@ async function waitForCfPass(page) {
     if (i % 6 === 0) {          // 每 30 秒给界面一个心跳，让人知道程序还活着
       emit({ ev: 'challenge', ok: false, sec });
       log(`   还在等人机验证…（已等 ${sec} 秒）`);
+    }
+  }
+}
+
+// ---------- 结账页的「安全检查」 ----------
+// Fab 的结账页（/payment/web/purchase 那个 iframe）在点完「Add to library」之后，有时会先弹
+// 一道安全检查（Epic 自己的风控），页面上的文案是「再进行一步操作 请完成安全检查以继续」。
+// 这一步**只能由人在页面上点**，程序替不了。所以跟 Cloudflare 挑战一样处理：
+// 不当成失败、不跳过，而是把浏览器窗口推到前面 + 提示用户去点，然后每 5 秒探一次，
+// 他点完就自动接着跑。（2026-10-06 实测日志：三件商品全卡在这里。）
+const SEC_MARK = /请完成安全检查|完成安全检查|安全验证|security check|verify you are human|confirm you are human/i;
+const SEC_WAIT = { pollMs: 5000, timeoutMs: 5 * 60 * 1000 };
+
+/**
+ * 等用户把结账页的安全检查点掉。readText 返回 {checkoutOk, text}（见 claimViaUi 里的 pageTexts）。
+ * 返回 true = 页面上已经没有安全检查了（可以继续），false = 等超时。
+ */
+async function waitForSecurityCheck(page, readText) {
+  log('⚠️ 结账页要求先完成安全检查（Epic 的风控，不是你操作错了）。');
+  log('   请切到浏览器窗口点一下验证框；程序每 5 秒自动检查，通过后会自己接着跑。');
+  emit({ ev: 'challenge', ok: false, kind: 'checkout' });
+  notify('Fab 领取', '结账页要求先完成安全检查 —— 请切到浏览器窗口点一下，程序会自己继续。');
+  // 把标签页调到前面。GUI 收到 challenge 事件后会临时取消置顶，所以这里调起来看得见。
+  await page.bringToFront().catch(() => {});
+  const t0 = Date.now();
+  for (let i = 1; ; i++) {
+    await sleep(SEC_WAIT.pollMs);
+    const r = await readText();
+    const sec = Math.round((Date.now() - t0) / 1000);
+    // 只有"结账框读到了、而且里面已经没有安全检查"才算过。
+    // 结账框正在刷新时读到的是空 —— 那不是"检查没了"，接着等。
+    if (RE.owned.test(r.text) || (r.checkoutOk && !SEC_MARK.test(r.text))) {
+      emit({ ev: 'challenge', ok: true, kind: 'checkout' });
+      log(`✅ 安全检查已通过（等了 ${sec} 秒），继续。`);
+      return true;
+    }
+    if (sec >= SEC_WAIT.timeoutMs / 1000) {
+      emit({ ev: 'challenge', ok: false, kind: 'checkout', timeout: true });
+      log(`❌ 安全检查等了 ${sec} 秒还没过，先停下。`);
+      return false;
+    }
+    if (i % 6 === 0) {          // 每 30 秒给界面一个心跳，让人知道程序还活着
+      emit({ ev: 'challenge', ok: false, kind: 'checkout', sec });
+      log(`   还在等安全检查…（已等 ${sec} 秒）`);
     }
   }
 }
@@ -527,29 +584,92 @@ async function claimViaUi(page, item, ctx) {
   await dumpNet(checkout, `结账页初始化(${how})`);
   if (checkout !== page) await dumpNet(page, '结账页初始化(主框架)');
 
+  // 结账 iframe 会自己刷新（安全检查通过后就会跳一次），刷新途中 Playwright 手里的 Frame
+  // 会失效。按 URL 重新找一遍就能接着用 —— 别把"刷新中"当成"失败"。
+  const refindCheckout = () => {
+    if (checkout === page) return checkout;
+    // 结账可能开在新标签里、也可能是同页 iframe（见上面第 3 步），两种都重新找一遍
+    const np = ctx.pages().find((p) => p !== page && PAY_RE.test(p.url()));
+    if (np) return (checkout = np);
+    const fr = page.frames().find((f) => PAY_RE.test(f.url()));
+    if (fr) return (checkout = fr);
+    return checkout;   // 都没找到就保持原样：读不到自然会被上层当成"这次没读到"
+  };
+  const readCheckout = async () => {
+    for (let i = 0; i < 2; i++) {
+      try { return { ok: true, text: (await checkout.evaluate(() => document.body.innerText)) || '' }; }
+      catch { refindCheckout(); await sleep(600); }
+    }
+    // 读失败（正在刷新）也算一种结果：调用方据此区分"没有安全检查"和"没读到"
+    return { ok: false, text: '' };
+  };
+  // 「结账框 + 主页面」的合计文本：成功文案可能出现在任意一边。
+  // checkoutOk=false 表示结账框这次没读到（正在刷新），别把它当成"页面上没有安全检查"。
+  const pageTexts = async () => {
+    const c = await readCheckout();
+    const p = await page.evaluate(() => document.body.innerText).catch(() => '');
+    return { checkoutOk: c.ok, text: [c.text, p].filter(Boolean).join(' \n ') };
+  };
+  const oneLine = (t, n) => String(t).replace(/\s+/g, ' ').slice(0, n);
+
   // 4) 点下单（Epic 结账页按钮文案是英文 "Add to library"）
-  const order = checkout.locator('button, a[role="button"], [role="button"]').filter({ hasText: RE.placeOrder });
-  if (!(await order.count())) {
-    log('    [UI] ✗ 找不到下单按钮');
-    const t = await checkout.evaluate(() => [...document.querySelectorAll('button')]
-      .filter((b) => b.getBoundingClientRect().height > 0)
-      .map((b) => (b.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30)).filter(Boolean).slice(0, 40));
-    log(`    [UI] 结账页可见按钮：${JSON.stringify([...new Set(t)])}`);
-    log(`    [UI] 结账页文本：${(await checkout.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ').slice(0, 300)}`);
-    return { ok: false, how: 'ui', info: 'no-place-order' };
+  const orderSel = 'button, a[role="button"], [role="button"]';
+  const orderLoc = () => refindCheckout().locator(orderSel).filter({ hasText: RE.placeOrder });
+  let clicked = false;
+  for (let attempt = 1; attempt <= 3 && !clicked; attempt++) {
+    try {
+      if (!(await orderLoc().count())) break;
+      log(`    [UI] 点击：${(await orderLoc().first().innerText()).trim().replace(/\s+/g, ' ').slice(0, 30)}`);
+      await orderLoc().first().click();
+      clicked = true;
+    } catch (e) {
+      if (attempt === 3 || !DETACH_ERR.test(e.message || '')) { log(`    [UI] ✗ 点下单按钮失败：${e.message}`); break; }
+      log(`    [UI] 结账框刷新了，重新找一遍再点（第 ${attempt + 1} 次）…`);
+      await sleep(1500);
+    }
   }
-  log(`    [UI] 点击：${(await order.first().innerText()).trim().replace(/\s+/g, ' ').slice(0, 30)}`);
-  await order.first().click();
+  if (!clicked) {
+    let has = 0;
+    try { has = await orderLoc().count(); } catch {}
+    if (!has) {
+      log('    [UI] ✗ 找不到下单按钮');
+      try {
+        const t = await checkout.evaluate(() => [...document.querySelectorAll('button')]
+          .filter((b) => b.getBoundingClientRect().height > 0)
+          .map((b) => (b.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30)).filter(Boolean).slice(0, 40));
+        log(`    [UI] 结账页可见按钮：${JSON.stringify([...new Set(t)])}`);
+      } catch {}
+      log(`    [UI] 结账页文本：${oneLine((await readCheckout()).text, 300)}`);
+      return { ok: false, how: 'ui', info: 'no-place-order' };
+    }
+    return { ok: false, how: 'ui', info: '点了下单按钮但结账框反复刷新，没能点成功' };
+  }
   await sleep(4000);
   await dumpNet(checkout, '下单后');
 
   // 成功判定：先看结账上下文，再看主页面（最终仍以 listings-states 接口为准）
-  for (const tgt of [checkout, page]) {
-    const txt = await tgt.evaluate(() => document.body.innerText).catch(() => '');
-    if (new RegExp(RE.owned.source, 'i').test(txt)) return { ok: true, how: 'ui' };
+  let { text: txt } = await pageTexts();
+  if (RE.owned.test(txt)) return { ok: true, how: 'ui' };
+
+  // 卡在安全检查上 —— 这一步只能让用户在浏览器窗口里点，程序探到他点完再继续
+  if (SEC_MARK.test(txt)) {
+    if (await waitForSecurityCheck(page, pageTexts)) {
+      ({ text: txt } = await pageTexts());
+      if (RE.owned.test(txt)) return { ok: true, how: 'ui' };
+      // 验证过了、但结账没自己往下走：多半还停在下单按钮上，再点一次
+      let has = 0;
+      try { has = await orderLoc().count(); } catch {}
+      if (has) {
+        log('    [UI] 安全检查已过，再点一次下单按钮');
+        await orderLoc().first().click().catch((e) => log(`    [UI] 再点失败：${e.message}`));
+        await sleep(4000);
+        ({ text: txt } = await pageTexts());
+        if (RE.owned.test(txt)) return { ok: true, how: 'ui' };
+      }
+    }
+    return { ok: false, how: 'ui', info: `未确认成功（结账页的安全检查没完成）。页面文本：${oneLine(txt, 300)}` };
   }
-  const body = await checkout.evaluate(() => document.body.innerText.slice(0, 300).replace(/\s+/g, ' ')).catch(() => '');
-  return { ok: false, how: 'ui', info: `未确认成功，页面文本：${body}` };
+  return { ok: false, how: 'ui', info: `未确认成功，页面文本：${oneLine(txt, 300)}` };
 }
 
 // ---------- 主流程 ----------
