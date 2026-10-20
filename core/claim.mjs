@@ -25,9 +25,10 @@
  */
 import { chromium } from 'playwright-core';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 数据目录（claimed.json / logs）由 GUI 通过 FAB_DATA 指定为程序根目录；直接跑则落到脚本目录
@@ -173,16 +174,16 @@ function fatal(code, text) {
 function friendlyReason(info) {
   const s = String(info || '');
   if (!s) return '未知原因';
-  if (SEC_MARK.test(s)) return '结账页要求先完成安全检查（人机验证）—— 请到浏览器窗口点一下，再重新领取';
-  if (/未确认成功/.test(s)) return '结账没走完，可能是验证码或安全检查没通过 —— 打开浏览器窗口手动领取一次最稳妥';
+  if (SEC_MARK.test(s)) return '结账页要求先完成安全检查（人机验证）。请到浏览器窗口点一下，再重新领取';
+  if (/未确认成功/.test(s)) return '结账没走完，可能是验证码或安全检查没通过。打开浏览器窗口手动领取一次最稳妥';
   if (/no-cta/.test(s)) return '商品页上没找到「领取」按钮，可能页面改版了';
   if (/no-place-order/.test(s)) return '结账页面没找到「Add to library」按钮，可能页面改版了';
   // 必须排在 401/403 那条前面：挑战页里也带 "HTTP 403"，混在一起会把风控说成掉登录
-  if (CF_MARK.test(s)) return '被 Cloudflare 人机验证拦住了 —— 请到浏览器窗口完成验证后重试';
+  if (CF_MARK.test(s)) return '被 Cloudflare 人机验证拦住了。请到浏览器窗口完成验证后重试';
   if (/HTTP 401|HTTP 403/.test(s)) return '登录状态失效了，请重新登录 Epic 账号';
   if (/HTTP 429/.test(s)) return '请求太频繁被限流，等几分钟再试';
   if (/复核未通过/.test(s)) return '结账后没能确认入库，请打开 Fab 网站手动看一眼';
-  if (DETACH_ERR.test(s)) return '结账窗口中途刷新，操作被打断了 —— 重试一次通常就好';
+  if (DETACH_ERR.test(s)) return '结账窗口中途刷新，操作被打断了。重试一次通常就好';
   if (/异常/.test(s)) return '网络或浏览器出现异常';
   if (/Not free/i.test(s)) return '限时免费商品走不了接口直领（属正常），改走真实点击后这次也没成功';
   return s.slice(0, 150);
@@ -263,15 +264,60 @@ async function dumpNet(page, tag) {
   }
 }
 
-/** 桌面通知（Windows toast）+ 可选微信推送。GUI 模式下 toast 由界面本身承担，跳过 */
-function notify(title, content) {
+// 当前那条"过程中提示"的 token（汇总通知是 sticky 的，不登记）
+let notifyToken = null;
+
+/** 让当前那条常驻通知自己收起来（验证码过了 / 要换成汇总通知时调用）。
+ *  不直接杀进程：窗口是由 cmd start 拉起的独立进程，这里落一个关闭信号文件，
+ *  窗口每秒检查一次自己关掉。 */
+function closeNotify() {
+  if (!notifyToken) return;
+  try { fs.writeFileSync(path.join(os.tmpdir(), `fab-notify-${notifyToken}.dismiss`), ''); } catch {}
+  notifyToken = null;
+}
+
+/**
+ * 桌面通知 + 可选微信推送。
+ *
+ * GUI 模式下界面自己会提示（黄色提示条），跳过。
+ * 非 GUI（计划任务）用右下角的**常驻窗口**，不是系统 toast —— toast 几秒就自己消失，
+ * 验证码这种"现在就要你动手"的提示很容易错过（用户 2026-10-20 反馈）。
+ * 窗口不点就一直留着；点「打开浏览器」能把浏览器调回前台。
+ *
+ * opts.sticky = true：脚本退出后窗口也保留（最终汇总用，让用户回来时还看得到）；
+ * 否则绑在当前进程上，进程一结束窗口自动关闭（验证码这种过程中提示用）。
+ */
+function notify(title, content, opts = {}) {
   if (!GUI) {
-    const ps = `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] > $null;` +
-      `$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);` +
-      `$n=$t.GetElementsByTagName('text');$n.Item(0).AppendChild($t.CreateTextNode(${JSON.stringify(title)})) > $null;` +
-      `$n.Item(1).AppendChild($t.CreateTextNode(${JSON.stringify(content)})) > $null;` +
-      `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Fab 领取').Show([Windows.UI.Notifications.ToastNotification]::new($t));`;
-    execFile('powershell', ['-NoProfile', '-Command', ps], () => {});
+    closeNotify();   // 先收掉上一条"过程中提示"
+    try {
+      const group = opts.sticky ? 'summary' : 'challenge';
+      const token = opts.sticky ? '' : `${process.pid}-${Date.now()}`;
+      // 参数走 JSON 文件：中文、换行、引号都能原样带上，不怕命令行转义
+      const payload = path.join(os.tmpdir(), `fab-notify-${process.pid}-${Date.now()}.json`);
+      fs.writeFileSync(payload, JSON.stringify({
+        title: String(title),
+        text: String(content),
+        group,
+        parentPid: opts.sticky ? 0 : process.pid,
+        settings: path.join(HERE, 'settings.json'),
+        token,
+      }), 'utf8');
+      // ★ 必须用 cmd /c start 拉起：直接 spawn 的 PowerShell 会跟着 Node 一起退出，
+      //   汇总那条要留到用户点掉，得脱离父进程（2026-10-20 实测，detached 也不行）。
+      // ★ 而且不能 unref：Node 一退出会把还没执行完的 cmd 一起带走，start 就轮不到了。
+      //   cmd 执行完 start 会立刻退出（PowerShell 是独立进程），这里让它自己收尾。
+      const proc = spawn('cmd.exe', [
+        '/c', 'start', '',
+        'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+        '-File', path.join(HERE, 'notify-persist.ps1'),
+        '-Payload', payload,
+      ], { stdio: 'ignore', windowsHide: true });
+      proc.on('error', () => {});
+      // 万一 cmd 卡住，5 秒后放开它，别把整个领取进程吊死
+      setTimeout(() => { try { proc.unref(); } catch {} }, 5000).unref();
+      if (!opts.sticky) notifyToken = token;
+    } catch { notifyToken = null; }
   }
 
   const tok = process.env.WXPUSHER_TOKEN, uid = process.env.WXPUSHER_UID;
@@ -348,6 +394,11 @@ function isCfChallenge(status, body) {
 const CF_WAIT = { pollMs: 5000, timeoutMs: 5 * 60 * 1000 };
 const CF_TIMEOUT_HINT = 'Cloudflare 人机验证一直没通过。请切到浏览器窗口把「确认您是真人」做完，然后重新点「刷新批次」。';
 
+// 本次运行里，用户是不是已经把某道人机验证点过了（Cloudflare 或结账页安全检查）。
+// 点过之后浏览器就算过了风控，前面因为验证码而失败的资产值得再试一次 ——
+// 见 main() 末尾的「验证通过后重试」。只记"通过"，没通过（超时）不算。
+let challengePassed = false;
+
 /** 被拦下时抛这个：调用方据此走「等用户过验证」而不是报错 */
 function cfError(what, status) {
   const e = new Error(`${what}被 Cloudflare 人机验证拦住（HTTP ${status}）`);
@@ -363,6 +414,7 @@ async function waitForCfPass(page) {
   log('⚠️ 被 Cloudflare 人机验证拦住了（Fab 前面的防护，不是你操作错了）。');
   log('   请切到浏览器窗口点一下验证框；程序每 5 秒自动检查，通过后会自己接着跑。');
   emit({ ev: 'challenge', ok: false });
+  notify('Fab 领取：需要你点一下验证', '被 Cloudflare 人机验证拦住了。请切到浏览器窗口点一下验证框，程序会自己继续。');
   // 把标签页调到前面。GUI 收到 challenge 事件后会临时取消置顶，所以这里调起来看得见。
   await page.bringToFront().catch(() => {});
   const t0 = Date.now();
@@ -374,11 +426,14 @@ async function waitForCfPass(page) {
     if (r && !r.blocked) {
       emit({ ev: 'challenge', ok: true });
       log(`✅ 人机验证已通过（等了 ${sec} 秒），继续。`);
+      challengePassed = true;
+      closeNotify();
       return true;
     }
     if (sec >= CF_WAIT.timeoutMs / 1000) {
       emit({ ev: 'challenge', ok: false, timeout: true });
       log(`❌ 人机验证等了 ${sec} 秒还没过，先停下。`);
+      closeNotify();
       return false;
     }
     if (i % 6 === 0) {          // 每 30 秒给界面一个心跳，让人知道程序还活着
@@ -399,30 +454,36 @@ const SEC_WAIT = { pollMs: 5000, timeoutMs: 5 * 60 * 1000 };
 
 /**
  * 等用户把结账页的安全检查点掉。readText 返回 {checkoutOk, text}（见 claimViaUi 里的 pageTexts）。
+ * stillBlocked 是可选探针：页面上还挂着可见的验证码控件时返回 true —— 文字提示有时比
+ * 控件晚出来，光看文字会把「验证码还在」当成「已经没了」。
  * 返回 true = 页面上已经没有安全检查了（可以继续），false = 等超时。
  */
-async function waitForSecurityCheck(page, readText) {
+async function waitForSecurityCheck(page, readText, stillBlocked = async () => false) {
   log('⚠️ 结账页要求先完成安全检查（Epic 的风控，不是你操作错了）。');
   log('   请切到浏览器窗口点一下验证框；程序每 5 秒自动检查，通过后会自己接着跑。');
   emit({ ev: 'challenge', ok: false, kind: 'checkout' });
-  notify('Fab 领取', '结账页要求先完成安全检查 —— 请切到浏览器窗口点一下，程序会自己继续。');
+  notify('Fab 领取', '结账页要求先完成安全检查。请切到浏览器窗口点一下验证框，程序会自己继续。');
   // 把标签页调到前面。GUI 收到 challenge 事件后会临时取消置顶，所以这里调起来看得见。
   await page.bringToFront().catch(() => {});
   const t0 = Date.now();
   for (let i = 1; ; i++) {
     await sleep(SEC_WAIT.pollMs);
     const r = await readText();
+    const blocked = await stillBlocked().catch(() => false);
     const sec = Math.round((Date.now() - t0) / 1000);
     // 只有"结账框读到了、而且里面已经没有安全检查"才算过。
     // 结账框正在刷新时读到的是空 —— 那不是"检查没了"，接着等。
-    if (RE.owned.test(r.text) || (r.checkoutOk && !SEC_MARK.test(r.text))) {
+    if (RE.owned.test(r.text) || (r.checkoutOk && !SEC_MARK.test(r.text) && !blocked)) {
       emit({ ev: 'challenge', ok: true, kind: 'checkout' });
       log(`✅ 安全检查已通过（等了 ${sec} 秒），继续。`);
+      challengePassed = true;
+      closeNotify();
       return true;
     }
     if (sec >= SEC_WAIT.timeoutMs / 1000) {
       emit({ ev: 'challenge', ok: false, kind: 'checkout', timeout: true });
       log(`❌ 安全检查等了 ${sec} 秒还没过，先停下。`);
+      closeNotify();
       return false;
     }
     if (i % 6 === 0) {          // 每 30 秒给界面一个心跳，让人知道程序还活着
@@ -615,10 +676,22 @@ async function claimViaUi(page, item, ctx) {
   // 4) 点下单（Epic 结账页按钮文案是英文 "Add to library"）
   const orderSel = 'button, a[role="button"], [role="button"]';
   const orderLoc = () => refindCheckout().locator(orderSel).filter({ hasText: RE.placeOrder });
+  // 结账页是异步渲染的：刚打开时整个框里只有 "Checkout" 一个标题，
+  // 按钮要等 purchase/initialize、order-preview 这些请求回来才出现。
+  // 2026-10-20 第一件商品就是 3.5 秒时按钮还没渲染出来，被当成「页面改版」直接放弃了。
+  // 所以这里要"等按钮出现"，不是看一眼没有就判死。
+  const btnDeadline = Date.now() + 20 * 1000;
+  const waitOrderBtn = async () => {
+    for (;;) {
+      try { if (await orderLoc().count()) return true; } catch { refindCheckout(); }
+      if (Date.now() >= btnDeadline) return false;
+      await sleep(500);
+    }
+  };
   let clicked = false;
   for (let attempt = 1; attempt <= 3 && !clicked; attempt++) {
     try {
-      if (!(await orderLoc().count())) break;
+      if (!(await waitOrderBtn())) break;
       log(`    [UI] 点击：${(await orderLoc().first().innerText()).trim().replace(/\s+/g, ' ').slice(0, 30)}`);
       await orderLoc().first().click();
       clicked = true;
@@ -644,16 +717,43 @@ async function claimViaUi(page, item, ctx) {
     }
     return { ok: false, how: 'ui', info: '点了下单按钮但结账框反复刷新，没能点成功' };
   }
-  await sleep(4000);
+  // 可见的人机验证控件探针：文字提示往往比控件晚一两秒出来，光看文字会漏。
+  // 2026-10-20 第二件商品就是这么被误判的 —— 验证码已经开始渲染了，
+  // 程序在 0.5 秒前刚读过文字，没看见「请完成安全检查」，直接判了「未确认成功」。
+  const challengeWidgetVisible = async () => {
+    const probe = () => [...document.querySelectorAll(
+      'iframe[src*="hcaptcha"], iframe[src*="recaptcha"], iframe[src*="challenges.cloudflare"],' +
+      ' iframe[title*="hCaptcha"], iframe[title*="challenge"]'
+    )].some((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+    });
+    try { if (await checkout.evaluate(probe)) return true; } catch { refindCheckout(); }
+    try { return await page.evaluate(probe); } catch { return false; }
+  };
+
+  // 点完之后结账页要做 4~15 秒的风控往返（talon 的 init/execute），验证码面板
+  // 也在这之后才弹出来。不能只等 4 秒看一眼就下结论 —— 改成轮询，直到
+  // ① 出现成功文案 ② 出现安全检查 ③ 超时，三者之一。
+  const SETTLE = { pollMs: 1000, timeoutMs: 25 * 1000 };
+  let txt = '';
+  let sawSec = false;
+  const t0 = Date.now();
+  for (;;) {
+    txt = (await pageTexts()).text;
+    if (RE.owned.test(txt)) break;
+    if (SEC_MARK.test(txt) || (await challengeWidgetVisible())) { sawSec = true; break; }
+    if (Date.now() - t0 >= SETTLE.timeoutMs) break;
+    await sleep(SETTLE.pollMs);
+  }
   await dumpNet(checkout, '下单后');
 
   // 成功判定：先看结账上下文，再看主页面（最终仍以 listings-states 接口为准）
-  let { text: txt } = await pageTexts();
   if (RE.owned.test(txt)) return { ok: true, how: 'ui' };
 
   // 卡在安全检查上 —— 这一步只能让用户在浏览器窗口里点，程序探到他点完再继续
-  if (SEC_MARK.test(txt)) {
-    if (await waitForSecurityCheck(page, pageTexts)) {
+  if (sawSec) {
+    if (await waitForSecurityCheck(page, pageTexts, challengeWidgetVisible)) {
       ({ text: txt } = await pageTexts());
       if (RE.owned.test(txt)) return { ok: true, how: 'ui' };
       // 验证过了、但结账没自己往下走：多半还停在下单按钮上，再点一次
@@ -861,9 +961,10 @@ async function main() {
     // ---- 领取 ----
     emit({ ev: 'phase', phase: 'claim', text: '开始领取…' });
     const claimed = loadClaimed();
-    let done = 0;
-    for (const t of todo) {
-      await randDelay();
+
+    // 领一个资产：通路A → 通路B → 接口复核 → 记进 claimed.json。
+    // 抽成函数是为了验证码过后能对失败的再跑一遍（见下面的重试）。
+    const claimOne = async (t) => {
       log(`→ 领取：${t.title}`);
       emit({ ev: 'item', uid: t.uid, title: t.title, state: 'claiming' });
       let res = { ok: false, how: '', info: '' };
@@ -905,7 +1006,6 @@ async function main() {
         claimed[t.uid] = { title: t.title, at: new Date().toISOString(), license: t.licSlug };
         saveClaimed(claimed);
       }
-      done++;
       log(`    ${res.ok ? '✅ 最终成功' : '✗ 最终失败'}  ${res.info}`);
       emit({
         ev: 'item', uid: t.uid, title: t.title,
@@ -913,10 +1013,44 @@ async function main() {
         reason: res.ok ? '' : friendlyReason(res.info),
         raw: res.info,
       });
-      emit({ ev: 'progress', done, total: todo.length });
-      summary.push({ ...t, ...res });
+      return res;
+    };
+
+    const results = [];
+    for (const t of todo) {
+      await randDelay();
+      results.push({ t, res: await claimOne(t) });
+      emit({ ev: 'progress', done: results.length, total: todo.length });
       await randDelay();
     }
+
+    // 本次出现过人机验证、而且用户已经点过了 → 前面失败的很可能就是验证码挡的，
+    // 再试一次。不重试的话，用户刚点完验证码，界面上却留着几个 ✗ ——
+    // 2026-10-20 实测跑的就是这种：三件商品只领成一件，另外两件全是验证码前后判死的。
+    if (challengePassed) {
+      const failed = results.filter((r) => !r.res.ok);
+      if (failed.length) {
+        log(`↻ 人机验证已通过，重新尝试刚才没领成的 ${failed.length} 个资产…`);
+        await sleep(2000);
+        for (const r of failed) {
+          // 先查归属：上一轮有可能其实已经领进去了，只是当时没确认到
+          try {
+            const st = await pageApi.states(page, [r.t.uid]);
+            if (st[r.t.uid] === true) {
+              r.res = { ok: true, how: 'state', info: (r.res.info ? r.res.info + ' | ' : '') + '接口复核=已拥有' };
+              claimed[r.t.uid] = { title: r.t.title, at: new Date().toISOString(), license: r.t.licSlug };
+              saveClaimed(claimed);
+              log(`    ✅ 复核：${r.t.title} 其实已经入库了`);
+              emit({ ev: 'item', uid: r.t.uid, title: r.t.title, state: 'ok', reason: '', raw: r.res.info });
+              continue;
+            }
+          } catch {}
+          await randDelay();
+          r.res = await claimOne(r.t);
+        }
+      }
+    }
+    summary.push(...results.map((r) => ({ ...r.t, ...r.res })));
 
     log('—— 汇总 ——');
     const okN = summary.filter((r) => r.ok).length;
@@ -933,11 +1067,12 @@ async function main() {
     if (needHelp.length) planNextCheck({ afterMs: GATE_CFG.retryAfterFailMs, result: 'partial-fail' });
     else planNextCheck({ batchEnd, result: 'ok' });
     if (needHelp.length) {
-      notify(`Fab 领取：${okN}/${summary.length} 成功`, `需要手动处理：\n${needHelp.map((r) => `· ${r.title}`).join('\n')}`);
+      notify(`Fab 领取：${okN}/${summary.length} 成功`, `需要手动处理：\n${needHelp.map((r) => `· ${r.title}`).join('\n')}`, { sticky: true });
     } else if (okN > 0) {
-      notify(`Fab 领取完成：${okN} 个已入库`, summary.map((r) => `· ${r.title}`).join('\n'));
+      notify(`Fab 领取完成：${okN} 个已入库`, summary.map((r) => `· ${r.title}`).join('\n'), { sticky: true });
     }
   } finally {
+    closeNotify();   // 过程中那条（如果还在）收掉；汇总那条是 sticky，不受影响
     await page.close().catch(() => {});
     await browser.close().catch(() => {});
     logStream?.end();
