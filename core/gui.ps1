@@ -1294,6 +1294,37 @@ function Set-TaskLogonTrigger([bool]$On) {
     }
 }
 
+# 老版本建的任务只有「每天 22:35 一次」，会错过 23:04 那个换批检查点（见 New-AutoClaimTask）。
+# 从旧版自动升级上来的用户不会自己去点一遍开关，所以这里静默重建一次，
+# 保留「开机自动检查」的勾选状态。指向别处的同名任务不碰。
+function Repair-AutoClaimTask {
+    try {
+        try { $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch { return }
+        if (-not (Get-TaskEnabled)) { return }
+        $daily = $t.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskDailyTrigger' } | Select-Object -First 1
+        # 注意：CIM 里 Repetition.Interval 回来的是 ISO8601 字符串（"PT30M"），
+        # 直接 [TimeSpan] 强转会抛异常 —— 得用 XmlConvert 解析。
+        $ivMin = 0
+        try {
+            if ($daily -and $daily.Repetition -and $daily.Repetition.Interval) {
+                $ivMin = [System.Xml.XmlConvert]::ToTimeSpan([string]$daily.Repetition.Interval).TotalMinutes
+            }
+        } catch {}
+        if ($ivMin -ge 30) { return }   # 已经是新形态
+        $logon = Get-TaskLogonTrigger
+        Add-Log '自动领取任务还是旧的时间表，正在升级成「22:35 起每 30 分钟检查一次」…'
+        if (-not (New-AutoClaimTask)) {
+            if ($logon) { [void](Set-TaskLogonTrigger $true) }   # 重建会清掉触发器，开机自启补回去
+            Add-Log '自动领取任务已升级：换批后半小时内就会检查并领取' 'ok'
+        } else {
+            Add-Log '自动领取任务升级失败 —— 可以在「自动领取」上取消勾选再勾一次重试' 'warn'
+        }
+    } catch {
+        # 升级失败绝不能影响界面启动
+        try { Add-Log "自动领取任务检查出错：$($_.Exception.Message)" 'warn' } catch {}
+    }
+}
+
 # ---------- 自动领取的健康检查 ----------
 # 计划任务是在没人看着的时候跑的，所以它失败必须能在下次打开界面时被发现。
 # 以前它失败只往 logs\task.log 写一行，而那个文件除了「详细日志」按钮没人会点开，
@@ -1350,6 +1381,8 @@ $form.Add_FormClosing({
 })
 
 $form.Add_Shown({
+    # 先看计划任务是不是旧时间表，是就静默升级（必须在读勾选状态之前）
+    Repair-AutoClaimTask
     $chk.Checked = Get-TaskEnabled
     # 查更新放最前面：它是个后台进程，不挡后面的启动流程，早点发出去早点有结果
     Start-UpdateCheck
