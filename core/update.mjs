@@ -53,7 +53,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 //   core\node_modules\  第三方依赖
 //   *.exe / *.lnk       正在运行的启动器换不掉
 const ALLOW = [
-  /^core\/[^/]+\.(ps1|mjs|cmd|bat|ico)$/i,
+  /^core\/[^/]+\.(ps1|mjs|cmd|bat|vbs|ico)$/i,
   /^(README\.md|LICENSE|THIRD-PARTY-NOTICES\.md|使用说明\.txt|version\.json)$/i,
 ];
 

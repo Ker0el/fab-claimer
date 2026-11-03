@@ -1222,6 +1222,55 @@ function Get-TaskForeignPath {
     return $null
 }
 
+# run-hidden.vbs 是 1.0.7 才有的文件，而 1.0.6 及更早的更新器白名单只放行
+# ps1/mjs/cmd/bat/ico —— 从老版本自动更新上来的用户，这个文件压根下不下来，
+# 计划任务就会指向一个不存在的脚本。所以界面上兜一手：缺了就按这里的文本补写。
+# 这里的字符串是唯一真相，仓库里那份 run-hidden.vbs 必须与它一致。
+$HiddenVbsText = @'
+' run-hidden.vbs -- start auto-claim.cmd without any console window.
+'
+' Why this exists: a scheduled task whose action is a .cmd gets a console window
+' in the user's session, so it flashes once per trigger. wscript.exe is a
+' GUI-subsystem host with no console of its own, and WScript.Shell.Run with
+' window style 0 (SW_HIDE) starts the child with no window either -- the whole
+' chain (cmd -> powershell -> node) stays invisible.
+'
+' bWaitOnReturn = True, so auto-claim.cmd's exit code reaches Task Scheduler
+' unchanged and the GUI's health check (LastTaskResult) keeps working.
+'
+' Keep this file ASCII + CRLF, exactly like auto-claim.cmd.
+
+Option Explicit
+
+Dim fso, sh, here, cmd, rc
+
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set sh  = CreateObject("WScript.Shell")
+
+here = fso.GetParentFolderName(WScript.ScriptFullName)
+cmd  = """" & fso.BuildPath(here, "auto-claim.cmd") & """"
+
+rc = sh.Run(cmd, 0, True)
+WScript.Quit rc
+'@
+
+function Ensure-HiddenVbs {
+    try {
+        $norm = { param($s) ($s -replace "`r`n", "`n").TrimStart([char]0xFEFF).Trim() }
+        if (Test-Path -LiteralPath $HiddenVbs) {
+            if ((& $norm ([System.IO.File]::ReadAllText($HiddenVbs))) -eq (& $norm $HiddenVbsText)) { return $true }
+        }
+        # 统一写成 CRLF：源文件的换行不可靠（编辑器/克隆都可能给 LF），
+        # 而 .vbs 和 .cmd 一样，按项目约定保持 CRLF
+        $out = ((($HiddenVbsText -replace "`r`n", "`n").TrimEnd()) -replace "`n", "`r`n") + "`r`n"
+        [System.IO.File]::WriteAllText($HiddenVbs, $out, (New-Object System.Text.ASCIIEncoding))
+        return $true
+    } catch {
+        try { Add-Log "写入 core\run-hidden.vbs 失败：$($_.Exception.Message)" 'warn' } catch {}
+        return $false
+    }
+}
+
 # ---------- 建 / 重建「每天自动领取」任务 ----------
 # 为什么不再用 schtasks.exe：
 #   1) 它一次只能建一种触发方式，也没法设「重复间隔」；
@@ -1239,7 +1288,13 @@ function New-AutoClaimTask {
         -RepetitionInterval (New-TimeSpan -Minutes 30) `
         -RepetitionDuration (New-TimeSpan -Hours 2)).Repetition
 
-    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "//B `"$HiddenVbs`""
+    # 动作走 run-hidden.vbs；文件不在（老版本更新器不下 .vbs）就补写一份，
+    # 写不出来就退回直连 auto-claim.cmd —— 会闪一下窗口，但总比任务指向不存在的文件强
+    $action = if (Ensure-HiddenVbs) {
+        New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "//B `"$HiddenVbs`""
+    } else {
+        New-ScheduledTaskAction -Execute $AutoCmd
+    }
     # 必须是交互式登录令牌：真要领的时候浏览器要出现在用户桌面上，验证码得他自己点。
     # 「不管用户是否登录都运行」会把浏览器扔进 session 0，用户看不见，等于领不了。
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
