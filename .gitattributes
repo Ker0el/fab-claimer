@@ -5,6 +5,7 @@
 *.cmd  text eol=crlf
 *.bat  text eol=crlf
 *.ps1  text eol=crlf
+*.vbs  text eol=crlf
 
 # 二进制文件一律不碰，免得 git 试图做行尾转换或增量压缩
 *.exe  binary

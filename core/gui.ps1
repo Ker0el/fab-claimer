@@ -49,6 +49,7 @@ $AppRoot   = (Get-Item (Join-Path $Core '..')).FullName        # 程序根目录
 $NodeExe   = Join-Path $Core 'node.exe'
 $ClaimJs   = Join-Path $Core 'claim.mjs'
 $AutoCmd   = Join-Path $Core 'auto-claim.cmd'
+$HiddenVbs = Join-Path $Core 'run-hidden.vbs'     # 计划任务的动作：经 wscript 无窗口拉起 auto-claim.cmd
 $LogDir    = Join-Path $AppRoot 'logs'
 $ClaimedJs = Join-Path $AppRoot 'claimed.json'
 $IconFile  = Join-Path $Core 'fab.ico'            # Fab 图标（窗口 / 任务栏 / 快捷方式）
@@ -1152,8 +1153,8 @@ $chk.Add_Click({
                 'Fab 领取助手', 'YesNo', 'Question')
             if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { $chk.Checked = $false; return }
         }
-        $out = & schtasks.exe /Create /TN $TaskName /TR "`"$AutoCmd`"" /SC DAILY /ST 22:35 /F 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $out = New-AutoClaimTask          # 成功返回 $null，失败返回错误文本
+        if (-not $out) {
             Add-Log '已开启自动领取（Windows 计划任务；平时只做一次秒级检查，换批后才真正动作）' 'ok'
             Set-Status '已开启自动领取' 'ok'
             $chkAuto.Enabled = $true
@@ -1187,25 +1188,79 @@ $chkAuto.Add_Click({
     }
 })
 
-function Get-TaskEnabled {
+# 任务的动作指向哪里？现在有两种形态：
+#   - 老版本：Execute 直接就是 auto-claim.cmd
+#   - 现在：  Execute = wscript.exe，真正跑的脚本在 Arguments 里（//B "…\run-hidden.vbs"）
+# 两种都得认，否则界面会把自己的任务误判成外来任务，或者显示成「未开启」。
+function Get-TaskTarget {
     try {
         $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
         $act = $t.Actions | Select-Object -First 1
+        if (-not $act) { return $null }
         $exe = [string]$act.Execute
+        $arg = [string]$act.Arguments
         # 只按名字判断会误判：旧版本可能在别的目录注册过同名任务（本机就是这样，
         # 指向 D:\111\fab-claimer\run-daily.cmd）。必须确认指向的是本程序。
-        return ($exe -and $exe.StartsWith($AppRoot, [System.StringComparison]::OrdinalIgnoreCase))
-    } catch { return $false }
+        if ($exe -and $exe.StartsWith($AppRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $exe }
+        foreach ($m in [regex]::Matches($arg, '"([^"]+)"|(\S+)')) {
+            $p = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+            if ($p -and $p.StartsWith($AppRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $p }
+        }
+        return $exe
+    } catch { return $null }
+}
+
+function Get-TaskEnabled {
+    $p = Get-TaskTarget
+    return [bool]($p -and $p.StartsWith($AppRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
 
 function Get-TaskForeignPath {
     # 同名任务存在但指向别处时，返回那个路径，供提示用；否则返回 $null
-    try {
-        $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-        $exe = [string]($t.Actions | Select-Object -First 1).Execute
-        if ($exe -and -not $exe.StartsWith($AppRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $exe }
-    } catch {}
+    $p = Get-TaskTarget
+    if ($p -and -not $p.StartsWith($AppRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $p }
     return $null
+}
+
+# ---------- 建 / 重建「每天自动领取」任务 ----------
+# 为什么不再用 schtasks.exe：
+#   1) 它一次只能建一种触发方式，也没法设「重复间隔」；
+#   2) 现在需要的触发是「每天 22:35 起、每 30 分钟、持续 2 小时」。
+# Fab 换批固定在 22:59/23:00，而 claim.mjs 把下次检查排在换批 +5 分钟（23:04）。
+# 只靠每天一次 22:35 的触发永远赶不上这个点：换批当天 22:35 看到的还是旧批
+# （差 29 分钟），得等第二天 22:35 才补上，等于每次都晚一天。
+# 动作走 run-hidden.vbs：wscript.exe 是 GUI 子系统程序，自身没有控制台，
+# 再以窗口样式 0 拉 auto-claim.cmd，整条链路都不闪黑窗口。
+function New-AutoClaimTask {
+    # 返回 $null = 成功；返回字符串 = 失败原因（给界面和日志用）
+    $daily = New-ScheduledTaskTrigger -Daily -At '22:35'
+    # -Daily 不接受 -RepetitionInterval，只能借一个 -Once 触发器把 Repetition 对象扒过来
+    $daily.Repetition = (New-ScheduledTaskTrigger -Once -At '22:35' `
+        -RepetitionInterval (New-TimeSpan -Minutes 30) `
+        -RepetitionDuration (New-TimeSpan -Hours 2)).Repetition
+
+    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "//B `"$HiddenVbs`""
+    # 必须是交互式登录令牌：真要领的时候浏览器要出现在用户桌面上，验证码得他自己点。
+    # 「不管用户是否登录都运行」会把浏览器扔进 session 0，用户看不见，等于领不了。
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
+    # StartWhenAvailable：22:35 那会儿电脑关着或睡着，开机后补跑一次，否则这一天整段丢掉
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew
+
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $daily `
+            -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        return $null
+    } catch {
+        # 降级：还能建就把旧形态的任务建起来（没有夜间重复、会闪窗口），
+        # 别因为一个接口不可用就让「自动领取」整个开不了
+        $e = $_.Exception.Message
+        $out = & schtasks.exe /Create /TN $TaskName /TR "`"$AutoCmd`"" /SC DAILY /ST 22:35 /F 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Add-Log "计划任务降级创建（$e）：没有夜间重复检查，换批后可能晚一天才领" 'warn'
+            return $null
+        }
+        return "$e`n$out"
+    }
 }
 
 # ---------- 开机自启：给计划任务加/摘一个「登录时」触发器 ----------
