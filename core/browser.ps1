@@ -365,11 +365,13 @@ function Start-BrowserExe {
         [int]$Port = $(if ($script:BPort) { $script:BPort } else { 9222 }),
         [int]$WaitSec = 15
     )
-    if (-not (Test-Path -LiteralPath $script:BProfile)) {
-        New-Item -ItemType Directory -Path $script:BProfile -Force | Out-Null
-    }
     $proc = $null
     try {
+        # profile 目录建不出来（目录只读、ACL 拒绝、磁盘满）也必须走下面的失败返回。
+        # 放在 try 外面时，GUI 里这个异常会直接冒到 WinForms 事件，变成 .NET 弹窗。
+        if (-not (Test-Path -LiteralPath $script:BProfile)) {
+            New-Item -ItemType Directory -Path $script:BProfile -Force -ErrorAction Stop | Out-Null
+        }
         $proc = Start-Process -FilePath $Exe -PassThru -ErrorAction Stop -ArgumentList @(
             "--remote-debugging-port=$Port",
             "--user-data-dir=`"$script:BProfile`"",
@@ -433,8 +435,10 @@ function Ensure-BrowserWork {
     $say = { param($m) if ($Log) { & $Log $m } }
     if (-not $script:BPort) { Initialize-BPort }
     # tried 必须是可变集合：PS 5.1 里 @() 是固定大小的 Object[]，
-    # 对它 .Add() 会抛「集合的大小是固定的」，而且是在最后一个候选也失败时
-    # 才走到那行 —— 异常会一路冒到界面事件里，变成一个 .NET 未处理异常弹窗。
+    # 对它 .Add() 会抛「集合的大小是固定的」。这行在每个候选启动失败后都会执行，
+    # GUI 里 $ErrorActionPreference=Stop —— 第一个候选失败就把异常冒到界面事件里，
+    # 变成 .NET 未处理异常弹窗；计划任务模式（Continue）则是失败原因全丢，只剩
+    # 一句误导性的「试过 0 个浏览器」。
     $result = @{ ok = $false; exe = ''; source = ''; browser = ''; port = $script:BPort; error = $null;
                  tried = (New-Object System.Collections.ArrayList) }
 

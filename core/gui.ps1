@@ -82,7 +82,27 @@ function Sync-CdpPort {
 $script:Port = $script:BPort
 $script:CdpBase = "http://127.0.0.1:$($script:BPort)"
 
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+# 日志目录必须在界面起来之前就可写：claim.mjs 的日志、浏览器失败便条、健康检查
+# 全往这里写。程序被放进只读目录（Program Files、权限受限的共享盘）时，
+# 与其让脚本在 Stop 下静默退出、用户什么都看不到，不如直接说清楚该怎么办。
+try {
+    if (-not (Test-Path -LiteralPath $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-Null
+    }
+    # 目录存在 ≠ 能写：只读 ACL 下 Test-Path 是 true，真正写入才失败
+    $probe = Join-Path $LogDir '.write-test'
+    [System.IO.File]::WriteAllText($probe, 'ok')
+    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+} catch {
+    $why = $_.Exception.Message
+    try {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "程序所在的文件夹不可写，连日志目录都建不出来：`n`n$LogDir`n`n$why`n`n" +
+            '请把整个程序文件夹移到你有写权限的位置（比如桌面或 D 盘）再重新打开。',
+            'Fab 领取助手', 'OK', 'Error')
+    } catch {}
+    exit
+}
 
 # ---------- 状态 ----------
 $script:Proc      = $null
@@ -235,6 +255,7 @@ function Invoke-BrowserSearch {
         # 非终止错误也会在这里变成终止错误）。转成一条失败结果，走下面正常的提示流程。
         $msg = $_.Exception.Message
         try { Add-Log "查找浏览器时出错：$msg" 'err' } catch {}
+        try { Write-BError "查找浏览器时出错：$msg" } catch {}
         $r = @{ ok = $false; exe = ''; source = ''; browser = ''; port = $script:BPort
                 error = "查找浏览器时出错：$msg"
                 tried = (New-Object System.Collections.ArrayList) }
