@@ -432,7 +432,11 @@ function Ensure-BrowserWork {
     )
     $say = { param($m) if ($Log) { & $Log $m } }
     if (-not $script:BPort) { Initialize-BPort }
-    $result = @{ ok = $false; exe = ''; source = ''; browser = ''; port = $script:BPort; error = $null; tried = @() }
+    # tried 必须是可变集合：PS 5.1 里 @() 是固定大小的 Object[]，
+    # 对它 .Add() 会抛「集合的大小是固定的」，而且是在最后一个候选也失败时
+    # 才走到那行 —— 异常会一路冒到界面事件里，变成一个 .NET 未处理异常弹窗。
+    $result = @{ ok = $false; exe = ''; source = ''; browser = ''; port = $script:BPort; error = $null;
+                 tried = (New-Object System.Collections.ArrayList) }
 
     # 端口上已经有一个能直接用的浏览器 —— 复用（这是最常见的情况）
     $re = Test-CdpReusable -Port $script:BPort

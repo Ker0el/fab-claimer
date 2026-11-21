@@ -223,10 +223,21 @@ function Select-BrowserDialog {
 
 # 跑一遍完整的候选搜索 + 启动 + 验证。进度刷到状态栏。
 function Invoke-BrowserSearch {
-    $r = Ensure-BrowserWork -Log {
-        param($m)
-        Set-Status $m 'run'
-        [System.Windows.Forms.Application]::DoEvents()
+    try {
+        $r = Ensure-BrowserWork -Log {
+            param($m)
+            Set-Status $m 'run'
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } catch {
+        # browser.ps1 里任何一个没被它自己兜住的异常，都不该让整个界面变成
+        # 「.NET Framework 未处理异常」弹窗（本文件 $ErrorActionPreference=Stop，
+        # 非终止错误也会在这里变成终止错误）。转成一条失败结果，走下面正常的提示流程。
+        $msg = $_.Exception.Message
+        try { Add-Log "查找浏览器时出错：$msg" 'err' } catch {}
+        $r = @{ ok = $false; exe = ''; source = ''; browser = ''; port = $script:BPort
+                error = "查找浏览器时出错：$msg"
+                tried = (New-Object System.Collections.ArrayList) }
     }
     Sync-CdpPort
     if ($r.ok) { Add-Log "浏览器：$($r.browser)（来自 $($r.source)）" 'ok' }
